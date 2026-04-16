@@ -16,6 +16,7 @@ dependencies = [
   "psycopg2-binary>=2.9.9",
   "sshtunnel==0.4.0",
   "paramiko==3.5.0",
+  "keyring>=25.6.0",
   "python-dotenv==1.0.1",
 ]
 
