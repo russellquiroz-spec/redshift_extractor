@@ -18,3 +18,9 @@ class RedshiftConfig:
     dbname: str
     user: str
     password: str
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    log_level: str = "INFO"
+    output_dir: str = "./output"

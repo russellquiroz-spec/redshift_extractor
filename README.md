@@ -1,148 +1,204 @@
 redshift_extractor
 
-Librería interna (y CLI opcional) para extraer datos desde Amazon Redshift a través de un túnel SSH (bastion/jump host). Soporta múltiples conexiones a Redshift mediante aliases, usa un env propio (.env.redshift_extractor) y no depende del .env del proyecto host.
+Libreria interna y CLI opcional para extraer datos desde Amazon Redshift por medio de un tunel SSH (bastion/jump host). Soporta multiples conexiones por alias, carga un env propio (`.env.redshift_extractor`) y evita depender del `.env` del proyecto host.
 
 --------------------------------------------------------------------------------
-¿QUÉ HACE?
+QUE HACE
 --------------------------------------------------------------------------------
-- Abre un túnel SSH hacia un bastion.
-- Conecta a Redshift usando psycopg2 vía localhost:<puerto_del_túnel>.
-- Ejecuta SQL y devuelve un pandas.DataFrame (uso como librería).
-- Opcional: guarda resultados a CSV y/o Parquet en un directorio definido por el usuario, sin dejar de regresar el DataFrame.
-- Permite definir varias bases/usuarios con aliases (ej: data-rabbit-prod, dev).
-- Opcional: emite eventos de estado estructurados (niveles DEBUG/INFO/WARNING/ERROR) para que el host los imprima o los lleve a su propio logger/UI.
+
+- Abre un tunel SSH hacia un bastion.
+- Conecta a Redshift usando `psycopg2` via `localhost:<puerto_del_tunel>`.
+- Ejecuta SQL y devuelve un `pandas.DataFrame`.
+- Opcionalmente guarda resultados a CSV y/o Parquet sin dejar de devolver el DataFrame.
+- Permite definir varias bases o usuarios con aliases, por ejemplo `prod` y `dev`.
+- Emite eventos de estado estructurados para que el proyecto host los imprima, registre o muestre en UI.
 
 --------------------------------------------------------------------------------
-PRINCIPIOS DE DISEÑO
+PRINCIPIOS DE DISENO
 --------------------------------------------------------------------------------
+
 - Library-first: API limpia para ser llamada desde otros proyectos.
-- Env aislado: carga solo su .env.redshift_extractor (no toca el .env del host).
-- Múltiples Redshift: selección por alias.
-- Estado sin acoplamiento: la librería no configura logging global; opcionalmente emite eventos y el host decide qué hacer con ellos.
-- Fail-fast: errores explícitos y tempranos.
-- Windows-friendly: normaliza aliases a lowercase para evitar el comportamiento case-insensitive de variables de entorno.
+- Env aislado: carga solo `.env.redshift_extractor`.
+- Credenciales fuera del repo: el env del extractor guarda configuracion no sensible y apunta a secretos externos.
+- Multiples Redshift: seleccion por alias.
+- Estado sin acoplamiento: la libreria no configura logging global.
+- Fail-fast: errores explicitos y tempranos.
+- Windows-friendly: normaliza aliases a lowercase y puede leer variables persistidas en registro.
 
 --------------------------------------------------------------------------------
-INSTALACIÓN (COMO LIBRERÍA INTERNA)
+INSTALACION
 --------------------------------------------------------------------------------
-Editable install (recomendado):
 
-1) Crear venv y activarlo:
-   python -m venv .venv
+Editable install recomendado:
 
-   Windows:
-   .venv\Scripts\activate
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -e .
+```
 
-   macOS/Linux:
-   source .venv/bin/activate
+Con dependencias de desarrollo:
 
-2) Instalar como editable desde el repo:
-   pip install -e /ruta/al/repo/redshift_extractor
+```powershell
+pip install -e ".[dev]"
+```
+
+Tambien puedes usar el instalador local:
+
+```powershell
+python install.py
+```
 
 --------------------------------------------------------------------------------
-CONFIGURACIÓN — .env.redshift_extractor
+CONFIGURACION: .env.redshift_extractor
 --------------------------------------------------------------------------------
-El extractor carga configuración solo desde un env propio en este orden:
-1) Variable REDSHIFT_EXTRACTOR_ENV_FILE (ruta absoluta o relativa),
-2) Búsqueda hacia arriba desde el package instalado (soporta editable installs) hasta encontrar .env.redshift_extractor.
 
-Importante: Nunca carga .env del proyecto host automáticamente.
+El extractor carga configuracion solo desde su env propio, en este orden:
 
---------------------
-SSH (BASTION)
---------------------
+1. `REDSHIFT_EXTRACTOR_ENV_FILE` si esta definida.
+2. Busqueda hacia arriba desde el package instalado hasta encontrar `.env.redshift_extractor`.
+
+Importante: nunca carga automaticamente el `.env` del proyecto host.
+
+### SSH (bastion)
+
+```env
 SSH_HOST=your.ssh.host
 SSH_PORT=22
 SSH_USER=ec2-user
 SSH_PKEY_PATH=/absolute/path/to/key.pem
+```
 
-- SSH_PKEY_PATH es la ruta a la llave .pem usada para autenticación SSH.
+### App opcional
 
---------------------
-APP (OPCIONALES)
---------------------
+```env
 LOG_LEVEL=INFO
 OUTPUT_DIR=./output
+```
 
-- LOG_LEVEL: si el proyecto host usa logging, puede usar esta variable; la librería no configura logging por sí sola.
-- OUTPUT_DIR: útil para flujos/CLI (si aplica). Para la API de librería, se recomienda pasar save_dir explícito.
+La libreria no configura logging por si sola. `OUTPUT_DIR` es util para flujos locales o CLI; para la API se recomienda pasar `save_dir` explicitamente.
 
---------------------
-REDSHIFT (MÚLTIPLES CONEXIONES POR ALIAS)
---------------------
-Formato:
-REDSHIFT__<ALIAS>__HOST=...
-REDSHIFT__<ALIAS>__PORT=5439
-REDSHIFT__<ALIAS>__DBNAME=...
-REDSHIFT__<ALIAS>__USER=...
-REDSHIFT__<ALIAS>__PASSWORD=...
+### Redshift por alias
 
-Ejemplo:
-REDSHIFT__data-rabbit-prod__HOST=your-core-cluster.xxxxxx.region.redshift.amazonaws.com
-REDSHIFT__data-rabbit-prod__PORT=5439
-REDSHIFT__data-rabbit-prod__DBNAME=core_db
-REDSHIFT__data-rabbit-prod__USER=core_user
-REDSHIFT__data-rabbit-prod__PASSWORD="core_password_with#chars"
+Patron recomendado: guardar host/puerto/base en `.env.redshift_extractor` y apuntar las credenciales a una variable de sistema o entrada de KeyringManager.
 
-REDSHIFT__dev__HOST=your-mkt-cluster.xxxxxx.region.redshift.amazonaws.com
+```env
+REDSHIFT__prod__HOST=your-prod-cluster.xxxxxx.region.redshift.amazonaws.com
+REDSHIFT__prod__PORT=5439
+REDSHIFT__prod__DBNAME=analytics
+REDSHIFT__prod__CREDENTIALS_ENV=REDSHIFT_PROD_CREDENTIALS
+
+REDSHIFT__dev__HOST=your-dev-cluster.xxxxxx.region.redshift.amazonaws.com
 REDSHIFT__dev__PORT=5439
-REDSHIFT__dev__DBNAME=mkt_db
-REDSHIFT__dev__USER=mkt_user
-REDSHIFT__dev__PASSWORD="mkt_password"
+REDSHIFT__dev__DBNAME=analytics_dev
+REDSHIFT__dev__CREDENTIALS_ENV=REDSHIFT_DEV_CREDENTIALS
+```
 
-Passwords:
-- Si contiene #, espacios, =, $, !, etc., usa comillas.
+`CREDENTIALS_ENV` debe resolver a credenciales con `user` y `password`.
+
+Formatos soportados para la variable de sistema:
+
+```text
+{"user":"db_user","password":"db_password"}
+USER=db_user;PASSWORD=db_password
+db_user:db_password
+```
+
+Tambien se soportan JSON con campos extra, JSON anidado y JSON escapado o envuelto como string. Si existe `%APPDATA%\KeyringManager\credentials.json`, el extractor intenta resolver primero una entrada cuyo `env_var` coincida con `CREDENTIALS_ENV`.
+
+Compatibilidad: `REDSHIFT__<ALIAS>__USER` y `REDSHIFT__<ALIAS>__PASSWORD` siguen funcionando, pero no son el patron recomendado. Si `CREDENTIALS_ENV` esta definido, tiene prioridad sobre `USER/PASSWORD`.
 
 Aliases:
-- Permiten letras, números, _ y -.
-- Internamente se normalizan a lowercase para que el usuario copie/pegue sin sorpresas en Windows.
+
+- Permiten letras, numeros, `_` y `-`.
+- Internamente se normalizan a lowercase para evitar sorpresas en Windows.
 
 --------------------------------------------------------------------------------
-USO COMO LIBRERÍA (RECOMENDADO)
+USO COMO LIBRERIA
 --------------------------------------------------------------------------------
+
 Listar bases disponibles:
-from redshift_extractor import list_databases
-print(list_databases())
-# ['data-rabbit-prod', 'dev']
 
-Ejecutar SQL y obtener DataFrame:
+```python
+from redshift_extractor import list_databases
+
+print(list_databases())
+# ['dev', 'prod']
+```
+
+Ejecutar SQL:
+
+```python
 from redshift_extractor import extract_sql
 
 df = extract_sql(
-    db="data-rabbit-prod",
+    db="prod",
     query="select current_date as today;",
 )
 print(df.head())
+```
+
+Guardar resultados y devolver DataFrame:
+
+```python
+from redshift_extractor import extract_sql
+
+df = extract_sql(
+    "prod",
+    "select 1 as test;",
+    save_dir=r"C:\Users\TuUsuario\Documents\salidas_rs",
+    base_name="mi_extraccion",
+    save_csv=True,
+    save_parquet=True,
+)
+```
+
+Comportamiento:
+
+- Si `save_dir` es `None` o vacio, solo devuelve DataFrame.
+- Si `save_csv=True`, guarda `<base_name>.csv`.
+- Si `save_parquet=True`, guarda `<base_name>.parquet`.
+- Si `base_name` no se especifica, genera `alias_dbname_timestamp`.
+
+Para Parquet, pandas requiere `pyarrow` o `fastparquet`.
 
 --------------------------------------------------------------------------------
-EVENTOS DE ESTADO (NIVELES) — SIN LOGGING GLOBAL
+EVENTOS DE ESTADO
 --------------------------------------------------------------------------------
-Puedes pasar un callback on_event para recibir eventos con niveles:
-- DEBUG, INFO, WARNING, ERROR
+
+Puedes pasar `on_event` para recibir eventos con niveles `DEBUG`, `INFO`, `WARNING` y `ERROR`.
 
 Cada evento es un dict con:
-- ts (ISO datetime)
-- level
-- event (tipo)
-- message
-- campos extra (ej: db, dbname, rows, cols, path, etc.)
 
-Ejemplo: imprimir eventos en consola (Jupyter friendly)
+- `ts`
+- `level`
+- `event`
+- `message`
+- campos extra como `db`, `rows`, `cols` o `path`
+
+Ejemplo para consola o Jupyter:
+
+```python
 def printer(evt):
     extras = {k: v for k, v in evt.items() if k not in ("ts", "level", "event", "message")}
     print(f'{evt["ts"]} [{evt["level"]}] {evt["event"]}: {evt["message"]} | {extras}')
 
-from redshift_extractor import list_databases, extract_sql
-print(list_databases(on_event=printer))
-df = extract_sql("data-rabbit-prod", "select 1 as test;", on_event=printer)
+from redshift_extractor import extract_sql, list_databases
 
-Ejemplo: enviar eventos al logger del host (sin que la librería configure nada)
+print(list_databases(on_event=printer))
+df = extract_sql("prod", "select 1 as test;", on_event=printer)
+```
+
+Ejemplo para logger del host:
+
+```python
 import logging
+
 log = logging.getLogger("host")
 
 def to_logger(evt):
-    msg = evt["message"]
     level = evt["level"]
+    msg = evt["message"]
     if level == "DEBUG":
         log.debug(msg, extra=evt)
     elif level == "INFO":
@@ -152,68 +208,59 @@ def to_logger(evt):
     else:
         log.error(msg, extra=evt)
 
-df = extract_sql("data-rabbit-prod", "select 1;", on_event=to_logger)
+df = extract_sql("prod", "select 1;", on_event=to_logger)
+```
 
 --------------------------------------------------------------------------------
-GUARDAR RESULTADOS A CSV Y/O PARQUET (Y TAMBIÉN DEVOLVER DATAFRAME)
+CLI
 --------------------------------------------------------------------------------
-La extracción siempre devuelve DataFrame.
-Si además quieres persistir a disco, activa save_dir y el/los formatos:
 
-from redshift_extractor import extract_sql
+El paquete expone el comando `redshift-extractor`:
 
-df = extract_sql(
-    "data-rabbit-prod",
-    "select 1 as test;",
-    on_event=printer,                           # opcional
-    save_dir=r"C:\Users\TuUsuario\Documents\salidas_rs",
-    base_name="mi_extraccion",                  # opcional; si no se da, se genera uno
-    save_csv=True,
-    save_parquet=True,
-)
+```powershell
+redshift-extractor ls
+redshift-extractor run --db prod --query "select 1 as test" --out .\output\result.parquet --fmt parquet
+```
 
-Comportamiento:
-- Si save_dir es None (o vacío) -> solo extrae a DataFrame (no guarda nada).
-- Si save_dir está definido:
-  - save_csv=True guarda base_name.csv
-  - save_parquet=True guarda base_name.parquet
-- base_name si no se especifica: se genera con alias_dbname_timestamp.
-
-Requisitos Parquet:
-- pandas requiere pyarrow (recomendado) o fastparquet.
-- Recomendado: pyarrow>=18.
+Formatos soportados por CLI: `csv` y `parquet`.
 
 --------------------------------------------------------------------------------
-ESTRUCTURA DEL PROYECTO (MÓDULOS)
+ESTRUCTURA DEL PROYECTO
 --------------------------------------------------------------------------------
-- config.py: resuelve y carga el env propio; descubre conexiones por alias.
-- types.py: contratos (SSHConfig, RedshiftConfig, etc.).
-- tunnel.py: manejo del túnel SSH.
-- extractor.py: conexión a Redshift y API pública (list_databases, extract_sql), eventos y persistencia opcional.
-- io.py: utilidades de escritura (si lo separas del extractor).
-- cli.py: CLI/entrypoint (opcional).
+
+- `config.py`: localiza el env propio, carga SSH y descubre conexiones Redshift por alias.
+- `secret_loader.py`: resuelve credenciales desde KeyringManager, variables de sistema y registro de Windows.
+- `types.py`: contratos (`SSHConfig`, `RedshiftConfig`, etc.).
+- `tunnel.py`: manejo del tunel SSH.
+- `extractor.py`: API publica (`list_databases`, `extract_sql`), eventos y persistencia opcional.
+- `io.py`: utilidades de escritura.
+- `cli.py`: entrypoint de CLI.
 
 --------------------------------------------------------------------------------
 TROUBLESHOOTING
 --------------------------------------------------------------------------------
-- SSH auth falla: revisa usuario/key y permisos del .pem.
-  - Linux/macOS: chmod 400 key.pem
-- No llega a Redshift: verifica SG/VPC/rutas y REDSHIFT__<alias>__HOST/PORT.
-- Password “truncado” o raro: usa comillas si hay #, espacios u otros caracteres.
-- Alias no existe: revisa con list_databases() y confirma que el alias esté en el .env.redshift_extractor.
+
+- SSH auth falla: revisa `SSH_USER`, `SSH_PKEY_PATH` y permisos del `.pem`.
+- No llega a Redshift: verifica security groups, VPC/rutas y `REDSHIFT__<alias>__HOST/PORT`.
+- La variable de credenciales no aparece: abre una terminal nueva o valida el valor persistido en Windows.
+- Password raro o con escapes: usa JSON o revisa el parseo con `parse_credentials_secret`.
+- Alias no existe: revisa con `list_databases()` y confirma que el alias este en `.env.redshift_extractor`.
 
 --------------------------------------------------------------------------------
 SEGURIDAD
 --------------------------------------------------------------------------------
-- No commitees .env.redshift_extractor.
-- Usa secretos del runtime cuando aplique.
-- Mínimo privilegio (read-only si corresponde).
-- La librería no imprime ni loggea credenciales.
+
+- No commitear `.env.redshift_extractor`.
+- No guardar `USER/PASSWORD` en el env del repo salvo casos locales controlados.
+- Usar variables de sistema, KeyringManager o secretos del runtime.
+- Mantener privilegios minimos, idealmente read-only.
+- La libreria no imprime ni loggea credenciales.
 
 --------------------------------------------------------------------------------
 ROADMAP SUGERIDO
 --------------------------------------------------------------------------------
-- UNLOAD a S3 para grandes volúmenes.
+
+- UNLOAD a S3 para grandes volumenes.
 - Streaming/chunks para evitar picos de RAM.
-- Override de SSH por alias (si cambia bastion por entorno).
-- Checks de calidad (nulls/duplicados) y métricas de operación.
+- Override de SSH por alias si cambia bastion por entorno.
+- Checks de calidad y metricas de operacion.
