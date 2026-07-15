@@ -29,24 +29,31 @@ PRINCIPIOS DE DISENO
 INSTALACION
 --------------------------------------------------------------------------------
 
-Editable install recomendado:
+Plug-and-play con el instalador local. Crea el venv, instala el paquete editable con sus dependencias y genera `.env.redshift_extractor` desde el ejemplo si no existe:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -e .
+python install.py
 ```
 
 Con dependencias de desarrollo:
 
 ```powershell
-pip install -e ".[dev]"
+python install.py --dev
 ```
 
-Tambien puedes usar el instalador local:
+Luego activa el entorno y verifica:
 
 ```powershell
-python install.py
+.\.venv\Scripts\activate
+redshift-extractor ls
+```
+
+Instalacion manual equivalente (si prefieres no usar el instalador):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -e .          # o: pip install -e ".[dev]"
 ```
 
 --------------------------------------------------------------------------------
@@ -80,23 +87,18 @@ La libreria no configura logging por si sola. `OUTPUT_DIR` es util para flujos l
 
 ### Redshift por alias
 
-Patron recomendado: guardar host/puerto/base en `.env.redshift_extractor` y apuntar las credenciales a una variable de sistema o entrada de KeyringManager.
+Cada alias necesita `HOST`, `PORT` y `DBNAME`. Para las credenciales hay dos opciones (elige una por alias):
+
+Opcion A (recomendada): apuntar a una variable de sistema con `CREDENTIALS_ENV`.
 
 ```env
 REDSHIFT__prod__HOST=your-prod-cluster.xxxxxx.region.redshift.amazonaws.com
 REDSHIFT__prod__PORT=5439
 REDSHIFT__prod__DBNAME=analytics
 REDSHIFT__prod__CREDENTIALS_ENV=REDSHIFT_PROD_CREDENTIALS
-
-REDSHIFT__dev__HOST=your-dev-cluster.xxxxxx.region.redshift.amazonaws.com
-REDSHIFT__dev__PORT=5439
-REDSHIFT__dev__DBNAME=analytics_dev
-REDSHIFT__dev__CREDENTIALS_ENV=REDSHIFT_DEV_CREDENTIALS
 ```
 
-`CREDENTIALS_ENV` debe resolver a credenciales con `user` y `password`.
-
-Formatos soportados para la variable de sistema:
+`CREDENTIALS_ENV` debe resolver a credenciales con `user` y `password`. Formatos soportados para la variable de sistema:
 
 ```text
 {"user":"db_user","password":"db_password"}
@@ -106,7 +108,17 @@ db_user:db_password
 
 Tambien se soportan JSON con campos extra, JSON anidado y JSON escapado o envuelto como string. Si existe `%APPDATA%\KeyringManager\credentials.json`, el extractor intenta resolver primero una entrada cuyo `env_var` coincida con `CREDENTIALS_ENV`.
 
-Compatibilidad: `REDSHIFT__<ALIAS>__USER` y `REDSHIFT__<ALIAS>__PASSWORD` siguen funcionando, pero no son el patron recomendado. Si `CREDENTIALS_ENV` esta definido, tiene prioridad sobre `USER/PASSWORD`.
+Opcion B (solo uso local): credenciales inline con `USER`/`PASSWORD`.
+
+```env
+REDSHIFT__dev__HOST=your-dev-cluster.xxxxxx.region.redshift.amazonaws.com
+REDSHIFT__dev__PORT=5439
+REDSHIFT__dev__DBNAME=analytics_dev
+REDSHIFT__dev__USER=db_user
+REDSHIFT__dev__PASSWORD=db_password
+```
+
+Omite `CREDENTIALS_ENV` para usar esta opcion. Si `CREDENTIALS_ENV` esta definido, tiene prioridad sobre `USER/PASSWORD`.
 
 Aliases:
 

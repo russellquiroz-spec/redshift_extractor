@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ def run(cmd: list[str]) -> None:
 
 
 def main() -> None:
+    dev = "--dev" in sys.argv[1:]
     root = Path(__file__).resolve().parent
     venv_dir = root / ".venv"
 
@@ -20,29 +22,27 @@ def main() -> None:
 
     if os.name == "nt":
         python_bin = venv_dir / "Scripts" / "python.exe"
-        pip_bin = venv_dir / "Scripts" / "pip.exe"
     else:
         python_bin = venv_dir / "bin" / "python"
-        pip_bin = venv_dir / "bin" / "pip"
 
-    run([str(pip_bin), "install", "--upgrade", "pip"])
-    run(
-        [
-            str(pip_bin),
-            "install",
-            "-r",
-            str(root / "requirements.txt"),
-            "-r",
-            str(root / "requirements-dev.txt"),
-        ]
-    )
+    run([str(python_bin), "-m", "pip", "install", "--upgrade", "pip"])
 
-    print("\n✅ Instalación completada.")
+    target = ".[dev]" if dev else "."
+    run([str(python_bin), "-m", "pip", "install", "-e", target])
+
+    env_file = root / ".env.redshift_extractor"
+    example = root / ".env.example"
+    if not env_file.exists() and example.exists():
+        shutil.copyfile(example, env_file)
+        print(f"Creado {env_file.name} desde .env.example. Editalo con tus datos.")
+
+    print("\nInstalacion completada.")
     print("Activa el entorno virtual con:")
     if os.name == "nt":
         print(r"  .\.venv\Scripts\activate")
     else:
         print("  source .venv/bin/activate")
+    print("Verifica con:  redshift-extractor ls")
 
 
 if __name__ == "__main__":
