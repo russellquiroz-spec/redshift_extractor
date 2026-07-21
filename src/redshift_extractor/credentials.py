@@ -1,11 +1,11 @@
-from __future__ import annotations
-
 """
 Compatibilidad hacia atras.
 
 Este modulo conserva los nombres originales mientras delega la logica real
 al helper publico y reusable en `redshift_extractor.secret_loader`.
 """
+
+from __future__ import annotations
 
 from redshift_extractor.secret_loader import (
     normalize_plain_secret,

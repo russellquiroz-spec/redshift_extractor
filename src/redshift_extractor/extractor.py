@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 from datetime import datetime as dt
 from typing import Any, Callable, Dict, List, Literal, Optional
 
 import pandas as pd
 import psycopg2
-import paramiko
+import paramiko  # type: ignore[import-untyped]
 from sshtunnel import BaseSSHTunnelForwarderError
 
 from redshift_extractor.config import load_config
@@ -158,6 +157,7 @@ def extract_sql(
     # Normaliza lógica de guardado
     want_save = bool(save_dir) and (save_csv or save_parquet)
     if want_save:
+        assert save_dir is not None
         out_dir = Path(save_dir).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
         # nombre base por defecto

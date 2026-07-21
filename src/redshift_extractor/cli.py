@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import typer
 
 from redshift_extractor.extractor import extract_sql, list_databases
@@ -13,7 +10,7 @@ app = typer.Typer(add_completion=False)
 
 
 @app.command()
-def ls():
+def ls() -> None:
     """
     Lista aliases disponibles.
     """
@@ -28,7 +25,7 @@ def run(
     query: str = typer.Option(..., help="SQL a ejecutar (entre comillas)"),
     out: str = typer.Option("./output/result.parquet", help="Ruta de salida"),
     fmt: str = typer.Option("parquet", help="csv|parquet"),
-):
+) -> None:
     """
     Ejecuta un query y guarda el resultado a archivo.
     """
