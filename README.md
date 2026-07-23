@@ -236,6 +236,29 @@ redshift-extractor run --db prod --query "select 1 as test" --out .\output\resul
 
 Formatos soportados por CLI: `csv` y `parquet`.
 
+### run-file
+
+Ejecuta un archivo `.sql` directamente. Por defecto envuelve el query con `LIMIT 10` para una prueba rapida (solo aplica a `SELECT`/`WITH`); usa `--full` para el query completo.
+
+```powershell
+redshift-extractor run-file query.sql --db prod                       # prueba: LIMIT 10
+redshift-extractor run-file query.sql --db prod --full                # query completo
+redshift-extractor run-file query.sql --db prod --print-sql --dry-run # arma e imprime el SQL, no ejecuta
+redshift-extractor run-file query.sql --db prod --full --output resultado.csv
+```
+
+Opciones:
+
+- `--db`: alias de conexion (requerido; ver con `redshift-extractor ls`).
+- `--limit`: filas para el modo prueba. Default: 10.
+- `--full`: ejecuta el SQL completo, sin envolverlo con `LIMIT`.
+- `--retries` / `--retry-wait`: reintentos ante fallos de conexion. Default: 3 intentos, 5s de espera.
+- `--print-sql`: imprime el SQL final que se va a ejecutar.
+- `--dry-run`: solo arma/imprime el SQL final; no lo ejecuta.
+- `--output`: opcional, guarda el resultado en CSV.
+
+Imprime una muestra de las primeras filas del resultado en consola.
+
 --------------------------------------------------------------------------------
 ESTRUCTURA DEL PROYECTO
 --------------------------------------------------------------------------------
