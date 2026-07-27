@@ -15,6 +15,15 @@ from redshift_extractor.types import RedshiftConfig
 from pathlib import Path
 import os
 
+
+def _read_sql_file(sql_file: str | Path) -> str:
+    path = Path(sql_file).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"No existe el archivo: {path}")
+    if not path.is_file():
+        raise ValueError(f"No es un archivo: {path}")
+    return path.read_text(encoding="utf-8")
+
 Level = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 EventType = Literal[
     "CONFIG_LOADED",
@@ -81,8 +90,9 @@ def list_databases(*, on_event: Optional[OnEvent] = None) -> List[str]:
 
 def extract_sql(
     db: str,
-    query: str,
+    query: Optional[str] = None,
     *,
+    query_file: Optional[str] = None,
     on_event: Optional[OnEvent] = None,
     save_dir: Optional[str] = None,
     base_name: Optional[str] = None,
@@ -95,6 +105,11 @@ def extract_sql(
     """
     Ejecuta un SQL en el alias `db` y devuelve un DataFrame.
 
+    Parámetros:
+      - db: alias de base de datos
+      - query: SQL a ejecutar (prioridad sobre query_file)
+      - query_file: ruta a un archivo .sql (usado si query es None)
+
     Persistencia opcional:
       - save_dir: carpeta destino (si None, no guarda nada)
       - base_name: nombre base (sin extensión). Si None, genera uno.
@@ -105,8 +120,18 @@ def extract_sql(
       - Para Parquet, pandas requiere pyarrow o fastparquet.
         Recomendado: pyarrow>=18 (ya lo traías).
       - Si save_dir existe, se crea (mkdir -p).
+      - Si se proporciona query, query_file es ignorado.
     """
     started = dt.now()
+
+    # Preferencia: query > query_file
+    if query is not None:
+        final_query = query
+    elif query_file is not None:
+        final_query = _read_sql_file(query_file)
+    else:
+        raise ValueError("Debes proporcionar 'query' o 'query_file'.")
+
     db_in = db
     db = db.lower()
 
@@ -227,7 +252,7 @@ def extract_sql(
                     db=db,
                 )
 
-                df = pd.read_sql(query, conn)
+                df = pd.read_sql(final_query, conn)
 
                 _emit(
                     on_event,

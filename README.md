@@ -138,17 +138,111 @@ print(list_databases())
 # ['dev', 'prod']
 ```
 
-Ejecutar SQL:
+Ejecutar SQL — parámetros `query` o `query_file`:
 
 ```python
 from redshift_extractor import extract_sql
 
+# Opción A: query directo
 df = extract_sql(
     db="prod",
     query="select current_date as today;",
 )
 print(df.head())
+
+# Opción B: desde archivo .sql
+df = extract_sql(
+    db="prod",
+    query_file="path/to/query.sql",
+)
+print(df.head())
+
+# Si proporciona ambos, query tiene prioridad
+df = extract_sql(
+    db="prod",
+    query="select 1;",
+    query_file="path/to/query.sql",  # ignorado
+)
+# Se ejecuta: "select 1;"
 ```
+
+Notas sobre `query_file`:
+- Archivo debe ser codificación UTF-8.
+- Se lee el contenido completo como SQL.
+- Si el archivo no existe, lanza `FileNotFoundError`.
+- `query` tiene prioridad sobre `query_file` (si ambos se proporcionan, se usa `query`).
+
+### Rutas: relativas, absolutas y home directory
+
+**Opción 1: Ruta relativa (respecto al current working directory)**
+```python
+# Estructura:
+# /proyecto/
+# ├── scripts/
+# │   └── extract.py
+# └── queries/
+#     └── usuarios.sql
+
+# En extract.py:
+df = extract_sql(db="prod", query_file="queries/usuarios.sql")
+
+# Funciona si ejecutas desde /proyecto:
+# $ cd /proyecto && python scripts/extract.py  ✓
+
+# Falla si ejecutas desde otro directorio:
+# $ cd /home/usuario && python /proyecto/scripts/extract.py  ✗
+```
+
+**Opción 2: Ruta absoluta (recomendado para robustez)**
+```python
+# Windows:
+df = extract_sql(db="prod", query_file=r"C:\Users\usuario\proyecto\queries\usuarios.sql")
+
+# Linux/macOS:
+df = extract_sql(db="prod", query_file="/home/usuario/proyecto/queries/usuarios.sql")
+
+# Funciona desde cualquier directorio ✓
+```
+
+**Opción 3: Ruta relativa al script (MEJOR PRÁCTICA)**
+```python
+# En extract.py:
+from pathlib import Path
+
+script_dir = Path(__file__).parent
+query_file = script_dir / ".." / "queries" / "usuarios.sql"
+
+df = extract_sql(db="prod", query_file=str(query_file))
+
+# Estructura:
+# /proyecto/
+# ├── scripts/
+# │   └── extract.py  <- __file__ = /proyecto/scripts/extract.py
+# │                      script_dir = /proyecto/scripts
+# │                      query_file = /proyecto/queries/usuarios.sql
+# └── queries/
+#     └── usuarios.sql
+
+# Funciona desde cualquier directorio ✓
+```
+
+**Opción 4: Home directory con `~`**
+```python
+# Expandir ~ automáticamente:
+df = extract_sql(db="prod", query_file="~/proyecto/queries/usuarios.sql")
+# En Windows: C:\Users\TuUsuario\proyecto\queries\usuarios.sql
+# En Linux:   /home/tuusuario/proyecto/queries/usuarios.sql
+
+# O con ruta construida:
+from pathlib import Path
+query_file = Path.home() / "proyecto" / "queries" / "usuarios.sql"
+df = extract_sql(db="prod", query_file=str(query_file))
+```
+
+**Resumen de preferencia de rutas:**
+1. **Para scripts en producción**: Opción 3 (relativa al script) — más portátil
+2. **Para uso interactivo (Jupyter, REPL)**: Opción 2 (absoluta) — más explícito
+3. **Para home directory**: Opción 4 con `~` — más conciso
 
 Guardar resultados y devolver DataFrame:
 

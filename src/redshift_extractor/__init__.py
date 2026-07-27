@@ -3,7 +3,8 @@ redshift_extractor: librería interna para extraer data desde Amazon Redshift v�
 
 API pública:
 - list_databases() -> List[str]
-- extract_sql(db: str, query: str) -> pandas.DataFrame
+- extract_sql(db: str, query: Optional[str] = None, query_file: Optional[str] = None) -> pandas.DataFrame
+  (query tiene prioridad sobre query_file)
 """
 from redshift_extractor.extractor import extract_sql, list_databases
 __all__ = ["extract_sql", "list_databases"]
