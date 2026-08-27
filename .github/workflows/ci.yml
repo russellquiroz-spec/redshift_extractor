@@ -1,9 +1,17 @@
 name: CI
 
 on:
-  pull_request:
+  # Todas las ramas, no solo main: el valor de la matriz esta en enterarse del
+  # fallo al pushear la rama, no al abrir el PR.
   push:
-    branches: [ "main" ]
+  pull_request:
+
+# Un push sobre una rama con PR abierto dispara dos corridas -la cabeza de la rama
+# y el resultado del merge- y las dos importan: main puede haberse movido. Lo que se
+# evita es apilarlas: cada push nuevo cancela la corrida anterior de su mismo ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
