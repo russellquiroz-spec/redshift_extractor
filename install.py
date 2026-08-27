@@ -43,6 +43,7 @@ def main() -> None:
     else:
         print("  source .venv/bin/activate")
     print("Verifica con:  redshift-extractor ls")
+    print("Para guardar Parquet:  pip install -e \".[parquet]\"")
 
 
 if __name__ == "__main__":
