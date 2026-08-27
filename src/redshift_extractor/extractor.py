@@ -1,19 +1,50 @@
 from __future__ import annotations
 
+import os
+import time
 from datetime import datetime as dt
-from typing import Any, Callable, Dict, List, Literal, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional
 
 import pandas as pd
-import psycopg2
 import paramiko  # type: ignore[import-untyped]
+import psycopg2
 from sshtunnel import BaseSSHTunnelForwarderError
 
-from redshift_extractor.config import load_config
+from redshift_extractor import config as _config
+from redshift_extractor.errors import (
+    QueryError,
+    RedshiftExtractorError,
+    TunnelError,
+)
+from redshift_extractor.events import OnEvent, StatusEvent, emit
+from redshift_extractor.io import write_parquet
 from redshift_extractor.tunnel import open_tunnel
 from redshift_extractor.types import RedshiftConfig
 
-from pathlib import Path
-import os
+Level = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
+EventType = Literal[
+    "CONFIG_LOADED",
+    "ALIAS_RESOLVED",
+    "TUNNEL_START",
+    "TUNNEL_READY",
+    "TUNNEL_CLOSED",
+    "DB_CONNECT_START",
+    "DB_CONNECTED",
+    "QUERY_START",
+    "QUERY_OK",
+    "FILE_SAVED",
+    "CONNECTION_CLOSED",
+    "DONE",
+    "ERROR",
+]
+
+# `OnEvent` y `StatusEvent` vivian aqui antes de que existiera events.py (G1). Se
+# re-exportan para no romper a quien haga
+# `from redshift_extractor.extractor import OnEvent`.
+_emit = emit
+
+_CONNECT_TIMEOUT_S = 15
 
 
 def _read_sql_file(sql_file: str | Path) -> str:
@@ -24,74 +55,53 @@ def _read_sql_file(sql_file: str | Path) -> str:
         raise ValueError(f"No es un archivo: {path}")
     return path.read_text(encoding="utf-8")
 
-Level = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
-EventType = Literal[
-    "CONFIG_LOADED",
-    "ALIAS_RESOLVED",
-    "TUNNEL_START",
-    "TUNNEL_READY",
-    "DB_CONNECT_START",
-    "DB_CONNECTED",
-    "QUERY_START",
-    "QUERY_OK",
-    "CONNECTION_CLOSED",
-    "DONE",
-    "ERROR",
-]
 
-StatusEvent = Dict[str, Any]
-OnEvent = Callable[[StatusEvent], None]
-
-
-def _noop_event(_: StatusEvent) -> None:
-    return
-
-
-def _emit(
-    on_event: Optional[OnEvent],
-    *,
-    level: Level,
-    event: EventType,
-    message: str,
-    **fields: Any,
-) -> None:
-    if on_event is None:
-        return
-    payload: StatusEvent = {
-        "ts": dt.now().isoformat(timespec="seconds"),
-        "level": level,
-        "event": event,
-        "message": message,
-        **fields,
-    }
-    on_event(payload)
-
-
-def list_available_databases(redshift_map: Dict[str, RedshiftConfig]) -> List[str]:
+def list_available_aliases(redshift_map: Dict[str, RedshiftConfig]) -> List[str]:
     return sorted(redshift_map.keys())
 
 
-def list_databases(*, on_event: Optional[OnEvent] = None) -> List[str]:
+def list_aliases(*, on_event: Optional[OnEvent] = None) -> List[str]:
     """
-    Lista aliases disponibles (normalizados a lowercase).
+    Lista los aliases configurados (normalizados a lowercase). No abre el tunel.
     """
-    ssh, rs_map = load_config()
-    _emit(
-        on_event,
-        level="INFO",
-        event="CONFIG_LOADED",
-        message="Config loaded.",
-        aliases=len(rs_map),
-        ssh_host=ssh.host,
-        ssh_port=ssh.port,
-    )
-    return list_available_databases(rs_map)
+    _app, _ssh, rs_map = _config.load_full_config(on_event=on_event)
+    return list_available_aliases(rs_map)
+
+
+def _connect(rs: RedshiftConfig, local_port: int) -> Any:
+    """Conecta a Redshift por el puerto local del tunel, envolviendo psycopg2 (F2)."""
+    try:
+        return psycopg2.connect(
+            # 127.0.0.1 y no "localhost": el tunel escucha solo en IPv4, y "localhost"
+            # resuelve primero a ::1 en Windows, asi que psycopg2 gasta un intento
+            # rechazado antes de dar con el puerto bueno.
+            host="127.0.0.1",
+            port=local_port,
+            dbname=rs.dbname,
+            user=rs.user,
+            password=rs.password,
+            connect_timeout=_CONNECT_TIMEOUT_S,
+        )
+    except psycopg2.Error as exc:
+        raise _query_error(exc) from exc
+
+
+def _query_error(exc: psycopg2.Error) -> QueryError:
+    msg = f"{exc}"
+    pgcode = getattr(exc, "pgcode", None)
+    pgerror = getattr(exc, "pgerror", None)
+    full = f"Error psycopg2: {msg}"
+    if pgcode:
+        full += f" | pgcode={pgcode}"
+    if pgerror:
+        full += f" | pgerror={pgerror}"
+    return QueryError(full)
 
 
 def extract_sql(
-    db: str,
     query: Optional[str] = None,
     *,
+    alias: Optional[str] = None,
     query_file: Optional[str] = None,
     on_event: Optional[OnEvent] = None,
     save_dir: Optional[str] = None,
@@ -103,24 +113,28 @@ def extract_sql(
     parquet_index: bool = False,
 ) -> pd.DataFrame:
     """
-    Ejecuta un SQL en el alias `db` y devuelve un DataFrame.
+    Ejecuta un SQL en el alias indicado y devuelve un DataFrame.
 
-    Parámetros:
-      - db: alias de base de datos
-      - query: SQL a ejecutar (prioridad sobre query_file)
-      - query_file: ruta a un archivo .sql (usado si query es None)
+    Forma canonica (E2, E4):
+
+        extract_sql("select 1")                      # alias = DEFAULT_ALIAS
+        extract_sql("select 1", alias="prod")
+        extract_sql(query_file="q.sql", alias="prod")
+
+    Parametros:
+      - query: SQL a ejecutar (prioridad sobre query_file). Posicional opcional.
+      - alias: alias del cluster. Keyword-only; si se omite, se usa `DEFAULT_ALIAS`
+        del env propio.
+      - query_file: ruta a un archivo .sql (usado si query es None).
 
     Persistencia opcional:
       - save_dir: carpeta destino (si None, no guarda nada)
-      - base_name: nombre base (sin extensión). Si None, genera uno.
-      - save_csv: guardar CSV
-      - save_parquet: guardar Parquet
+      - base_name: nombre base (sin extension). Si None, genera uno.
+      - save_csv / save_parquet: formatos a guardar. Parquet necesita el extra
+        `parquet` (pip install "redshift-extractor[parquet]").
 
-    Notas:
-      - Para Parquet, pandas requiere pyarrow o fastparquet.
-        Recomendado: pyarrow>=18 (ya lo traías).
-      - Si save_dir existe, se crea (mkdir -p).
-      - Si se proporciona query, query_file es ignorado.
+    Las formas de 0.1.0 —el alias como primer posicional y `db=` en vez de `alias=`—
+    se retiraron en 0.3.0. Un `extract_sql("prod", "select 1")` ahora es un TypeError.
     """
     started = dt.now()
 
@@ -132,69 +146,40 @@ def extract_sql(
     else:
         raise ValueError("Debes proporcionar 'query' o 'query_file'.")
 
-    db_in = db
-    db = db.lower()
-
-    _emit(
+    alias_in = alias
+    app, ssh, resolved, rs = _config.resolve(alias, on_event=on_event)
+    emit(
         on_event,
         level="INFO",
         event="ALIAS_RESOLVED",
         message="Resolving database alias.",
-        db_input=db_in,
-        db=db,
+        alias_input=alias_in,
+        alias=resolved,
     )
 
-    ssh, rs_map = load_config()
-    _emit(
-        on_event,
-        level="INFO",
-        event="CONFIG_LOADED",
-        message="Config loaded.",
-        aliases=len(rs_map),
-        ssh_host=ssh.host,
-        ssh_port=ssh.port,
-    )
-
-    if db not in rs_map:
-        available = sorted(rs_map.keys())
-        _emit(
-            on_event,
-            level="ERROR",
-            event="ERROR",
-            message="DB alias not found.",
-            db=db,
-            available=available,
-        )
-        raise ValueError(f"DB alias '{db}' no existe. Disponibles: {', '.join(available)}")
-
-    rs = rs_map[db]
-    _emit(
+    emit(
         on_event,
         level="INFO",
         event="TUNNEL_START",
         message="Establishing SSH tunnel.",
-        db=db,
+        alias=resolved,
         redshift_host=rs.host,
         redshift_port=rs.port,
         redshift_dbname=rs.dbname,
     )
 
-    # Normaliza lógica de guardado
+    # Normaliza logica de guardado
     want_save = bool(save_dir) and (save_csv or save_parquet)
+    csv_path = pq_path = None
     if want_save:
         assert save_dir is not None
         out_dir = Path(save_dir).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
-        # nombre base por defecto
-        if base_name:
-            bn = base_name
-        else:
-            ts = dt.now().strftime("%Y%m%d_%H%M%S")
-            bn = f"{db}_{rs.dbname}_{ts}"
+        bn = base_name or f"{resolved}_{rs.dbname}_{dt.now().strftime('%Y%m%d_%H%M%S')}"
         csv_path = out_dir / f"{bn}.csv"
         pq_path = out_dir / f"{bn}.parquet"
 
-        _emit(
+        emit(
             on_event,
             level="INFO",
             event="QUERY_START",
@@ -206,55 +191,40 @@ def extract_sql(
         )
 
     try:
-        with open_tunnel(ssh, rs) as tunnel:
-            _emit(
-                on_event,
-                level="INFO",
-                event="TUNNEL_READY",
-                message="SSH tunnel ready.",
-                local_port=tunnel.local_bind_port,
-            )
-
+        with open_tunnel(ssh, rs, on_event=on_event) as tunnel:
             conn = None
             try:
-                _emit(
+                emit(
                     on_event,
                     level="INFO",
                     event="DB_CONNECT_START",
                     message="Connecting to Redshift.",
-                    db=db,
+                    alias=resolved,
                     dbname=rs.dbname,
                 )
 
-                conn = psycopg2.connect(
-                    host="localhost",
-                    port=tunnel.local_bind_port,
-                    dbname=rs.dbname,
-                    user=rs.user,
-                    password=rs.password,
-                    connect_timeout=15,
-                )
+                conn = _connect(rs, tunnel.local_bind_port)
 
-                _emit(
+                emit(
                     on_event,
                     level="INFO",
                     event="DB_CONNECTED",
                     message="Connected to Redshift.",
-                    db=db,
+                    alias=resolved,
                     dbname=rs.dbname,
                 )
 
-                _emit(
+                emit(
                     on_event,
                     level="INFO",
                     event="QUERY_START",
                     message="Executing query.",
-                    db=db,
+                    alias=resolved,
                 )
 
                 df = pd.read_sql(final_query, conn)
 
-                _emit(
+                emit(
                     on_event,
                     level="INFO",
                     event="QUERY_OK",
@@ -263,45 +233,30 @@ def extract_sql(
                     cols=int(len(df.columns)),
                 )
 
-                # -------------------------
-                # Guardado opcional
-                # -------------------------
                 if want_save:
                     if save_csv:
-                        _emit(
-                            on_event,
-                            level="INFO",
-                            event="QUERY_START",
-                            message="Saving CSV output.",
-                            path=str(csv_path),
-                            rows=int(len(df)),
-                        )
+                        assert csv_path is not None
                         df.to_csv(csv_path, index=csv_index, encoding=csv_encoding)
-                        _emit(
+                        emit(
                             on_event,
                             level="INFO",
-                            event="QUERY_OK",
+                            event="FILE_SAVED",
                             message="CSV saved.",
                             path=str(csv_path),
+                            rows=int(len(df)),
                             bytes=int(os.path.getsize(csv_path)),
                         )
 
                     if save_parquet:
-                        _emit(
+                        assert pq_path is not None
+                        write_parquet(df, pq_path, index=parquet_index)
+                        emit(
                             on_event,
                             level="INFO",
-                            event="QUERY_START",
-                            message="Saving Parquet output.",
-                            path=str(pq_path),
-                            rows=int(len(df)),
-                        )
-                        df.to_parquet(pq_path, index=parquet_index)
-                        _emit(
-                            on_event,
-                            level="INFO",
-                            event="QUERY_OK",
+                            event="FILE_SAVED",
                             message="Parquet saved.",
                             path=str(pq_path),
+                            rows=int(len(df)),
                             bytes=int(os.path.getsize(pq_path)),
                         )
 
@@ -310,57 +265,122 @@ def extract_sql(
             finally:
                 if conn is not None:
                     conn.close()
-                    _emit(
+                    emit(
                         on_event,
                         level="DEBUG",
                         event="CONNECTION_CLOSED",
                         message="Connection closed.",
-                        db=db,
+                        alias=resolved,
                     )
 
+    except RedshiftExtractorError as e:
+        # Ya viene tipado y con mensaje accionable: no se re-envuelve.
+        emit(on_event, level="ERROR", event="ERROR", message=str(e), error_type=type(e).__name__)
+        raise
+
     except paramiko.ssh_exception.AuthenticationException as e:
-        _emit(on_event, level="ERROR", event="ERROR", message="SSH authentication failed.", error=str(e))
-        raise RuntimeError(
-            f"Error autenticación SSH: {e}. Revisa SSH_PKEY_PATH y permisos (chmod 400 en Linux/macOS)."
+        emit(on_event, level="ERROR", event="ERROR", message="SSH authentication failed.", error=str(e))
+        raise TunnelError(
+            f"Error autenticacion SSH: {e}. Revisa SSH_PKEY_PATH y permisos "
+            "(chmod 400 en Linux/macOS)."
         ) from e
 
     except BaseSSHTunnelForwarderError as e:
-        _emit(on_event, level="ERROR", event="ERROR", message="SSH tunnel failed.", error=str(e))
-        raise RuntimeError(
-            f"Error al establecer túnel SSH: {e}. Revisa SSH_HOST/SSH_PORT y conectividad al bastion."
+        emit(on_event, level="ERROR", event="ERROR", message="SSH tunnel failed.", error=str(e))
+        raise TunnelError(
+            f"Error al establecer tunel SSH: {e}. Revisa SSH_HOST/SSH_PORT y conectividad "
+            "al bastion."
         ) from e
 
     except psycopg2.Error as e:
-        msg = f"{e}"
-        pgcode = getattr(e, "pgcode", None)
-        pgerror = getattr(e, "pgerror", None)
-        _emit(
+        error = _query_error(e)
+        emit(
             on_event,
             level="ERROR",
             event="ERROR",
             message="Database error.",
-            error=msg,
-            pgcode=pgcode,
-            pgerror=pgerror,
+            error=str(e),
+            pgcode=getattr(e, "pgcode", None),
+            pgerror=getattr(e, "pgerror", None),
         )
-        full = f"Error psycopg2: {msg}"
-        if pgcode:
-            full += f" | pgcode={pgcode}"
-        if pgerror:
-            full += f" | pgerror={pgerror}"
-        raise RuntimeError(full) from e
+        raise error from e
 
     except Exception as e:
-        _emit(on_event, level="ERROR", event="ERROR", message="Unexpected error.", error=str(e))
-        raise RuntimeError(f"Error inesperado al extraer: {e}") from e
+        emit(on_event, level="ERROR", event="ERROR", message="Unexpected error.", error=str(e))
+        raise RedshiftExtractorError(f"Error inesperado al extraer: {e}") from e
 
     finally:
-        ended = dt.now()
-        _emit(
+        emit(
             on_event,
             level="INFO",
             event="DONE",
             message="Extraction finished.",
-            db=db.lower(),
-            elapsed_s=round((ended - started).total_seconds(), 3),
+            alias=resolved,
+            elapsed_s=round((dt.now() - started).total_seconds(), 3),
         )
+
+
+def ping(
+    alias: Optional[str] = None,
+    *,
+    on_event: Optional[OnEvent] = None,
+) -> Dict[str, Any]:
+    """
+    Verifica la conexion de punta a punta y reporta a donde quedo conectada de verdad.
+
+    `database` y `user` salen del servidor, no de la config: es la forma de detectar un
+    tunel que quedo apuntando al cluster equivocado. No expone credenciales (E6).
+
+    Devuelve la clave `"alias"`; nunca `"db"`, a proposito (contrato del renombre).
+    """
+    _app, ssh, resolved, rs = _config.resolve(alias, on_event=on_event)
+    started = time.perf_counter()
+
+    with open_tunnel(ssh, rs, on_event=on_event) as tunnel:
+        tunnel_port = int(tunnel.local_bind_port)
+        conn = _connect(rs, tunnel_port)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select version(), current_database(), current_user"
+                )
+                row = cur.fetchone()
+        except psycopg2.Error as exc:
+            raise _query_error(exc) from exc
+        finally:
+            conn.close()
+
+    latency_ms = round((time.perf_counter() - started) * 1000, 2)
+    result = {
+        "ok": True,
+        "alias": resolved,
+        "server_version": row[0],
+        "database": row[1],
+        "user": row[2],
+        "redshift_host": rs.host,
+        "redshift_port": rs.port,
+        "tunnel_port": tunnel_port,
+        "latency_ms": latency_ms,
+    }
+    emit(
+        on_event,
+        level="INFO",
+        event="QUERY_OK",
+        message=f"ping ok a {row[1]} como {row[2]}.",
+        alias=resolved,
+        local_port=tunnel_port,
+        elapsed_s=round(latency_ms / 1000, 3),
+    )
+    return result
+
+
+__all__ = [
+    "EventType",
+    "Level",
+    "OnEvent",
+    "StatusEvent",
+    "extract_sql",
+    "list_aliases",
+    "list_available_aliases",
+    "ping",
+]
