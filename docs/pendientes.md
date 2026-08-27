@@ -122,7 +122,7 @@ expone credenciales.
 Expuesto tambien como `redshift-extractor ping`. Verificado contra el bastion y el
 cluster real el 2026-08-27: `data-rabbit-prod` contesta en ~1.8 s.
 
-**Hallazgo al probarlo:** el alias `dev` (cluster `redshift-mvp`) **no es alcanzable
+**Hallazgo al probarlo:** el alias `dev` **no es alcanzable
 desde el bastion**. El health check lo dice en 15 s con exit code 3 y un mensaje que
 lista las tres causas probables; antes el sintoma era el `Timeout opening channel` que
 ya estaba documentado en la referencia y que se confundio con un problema de la
