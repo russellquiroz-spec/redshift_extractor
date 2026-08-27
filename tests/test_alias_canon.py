@@ -18,6 +18,7 @@ import pytest
 from typer.testing import CliRunner
 
 import redshift_extractor as rse
+from redshift_extractor import cli as cli_mod
 from redshift_extractor import config as config_mod
 from redshift_extractor import extractor as extractor_mod
 from redshift_extractor.cli import EXIT_OK, app
@@ -206,30 +207,27 @@ def test_cli_db_ya_no_se_acepta(write_env, minimal_env, tmp_path):
     assert resultado.exit_code == 2
 
 
-def _opciones_declaradas(comando: str) -> dict:
-    """
-    {declaracion: oculta?} de las opciones del comando, leidas de click.
-
-    Se introspecciona en vez de leer el texto de `--help` porque typer lo dibuja con
-    rich: el ancho de la terminal y los codigos de color parten los nombres, asi que
-    un `"--alias" in output` pasa en una maquina y falla en otra. Lo que el contrato
-    exige es que la opcion este declarada y visible, no como se renderiza.
-    """
-    import click
-    import typer.main
-
-    grupo = typer.main.get_command(app)
-    assert isinstance(grupo, click.Group)
-    declaradas = {}
-    for parametro in grupo.commands[comando].params:
-        for declaracion in getattr(parametro, "opts", []):
-            declaradas[declaracion] = bool(getattr(parametro, "hidden", False))
-    return declaradas
+#: Las funciones de comando del CLI que reciben un alias.
+COMANDOS_CON_ALIAS = ["ping_command", "fingerprint_command", "run", "run_file"]
 
 
-@pytest.mark.parametrize("comando", ["ping", "fingerprint", "run", "run-file"])
+@pytest.mark.parametrize("comando", COMANDOS_CON_ALIAS)
 def test_cli_todo_comando_con_alias_declara_alias_visible_y_no_db(comando):
-    opciones = _opciones_declaradas(comando)
-    assert "--alias" in opciones, opciones
-    assert opciones["--alias"] is False, "--alias debe salir en el --help"
-    assert "--db" not in opciones, "--db se retiro en 0.3.0"
+    """
+    Se lee la declaracion del comando, no el texto de `--help`.
+
+    Dos razones, las dos aprendidas en el CI: typer dibuja el help con rich, asi que
+    el ancho de la terminal y los codigos de color parten los nombres y un
+    `"--alias" in output` pasa en una maquina y falla en otra; e introspeccionar el
+    objeto de click obliga a importar click, que es una transitiva de typer y no
+    siempre esta como modulo propio. Aqui solo se usa lo que declara este repo.
+    """
+    funcion = getattr(cli_mod, comando)
+    parametros = inspect.signature(funcion).parameters
+
+    assert "alias" in parametros, f"{comando} no acepta --alias"
+    assert "db" not in parametros, f"{comando} volvio a aceptar --db"
+
+    opcion = parametros["alias"].default
+    assert "--alias" in getattr(opcion, "param_decls", ()), opcion
+    assert getattr(opcion, "hidden", False) is False, "--alias debe salir en el --help"
