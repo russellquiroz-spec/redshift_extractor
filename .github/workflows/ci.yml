@@ -45,4 +45,13 @@ jobs:
       # `integration` necesita el bastion y el cluster real; no existen en el runner.
       # Los de `sshserver` si corren: el servidor SSH de prueba es en proceso.
       - name: Tests
-        run: pytest -q -m "not integration"
+        run: |
+          set -o pipefail
+          pytest -q -m "not integration" 2>&1 | tee pytest.log
+
+      # El detalle del fallo solo vive en el log del job, que hay que abrir a mano y
+      # con permisos de lectura de Actions. Como anotacion sale en el check mismo.
+      - name: Reportar el fallo de la suite
+        if: failure()
+        run: |
+          echo "::error title=pytest (${{ matrix.python-version }})::$(tail -c 2200 pytest.log | tr '\n' '~')"

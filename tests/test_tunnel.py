@@ -128,17 +128,23 @@ def test_el_tunel_se_cierra_aunque_el_bloque_lance(tunnel_env):
 
 
 def test_puerto_local_efimero_por_default(tunnel_env):
-    """H5: SSH_LOCAL_PORT=0 es el default y da un puerto distinto cada vez."""
+    """
+    H5: SSH_LOCAL_PORT=0 es el default y dos tuneles no se pisan.
+
+    Los dos tuneles se abren a la vez a proposito. Abriendolos en secuencia, el
+    sistema operativo puede reasignar el mismo puerto efimero al segundo -es libre de
+    hacerlo, el primero ya lo solto- y la asercion dependeria de la politica de
+    asignacion de puertos de cada plataforma en vez de la libreria.
+    """
     tunnel_env()
     ssh, rs = _cfg()
     assert ssh.local_port == 0
 
     with open_tunnel(ssh, rs) as primero:
-        puerto_uno = primero.local_bind_port
-    with open_tunnel(ssh, rs) as segundo:
-        puerto_dos = segundo.local_bind_port
-
-    assert puerto_uno != puerto_dos
+        with open_tunnel(ssh, rs) as segundo:
+            assert primero.local_bind_port != segundo.local_bind_port
+            assert probe_redshift(primero.local_bind_port)
+            assert probe_redshift(segundo.local_bind_port)
 
 
 def test_health_check_es_de_protocolo_no_solo_tcp(fake_redshift):
@@ -495,7 +501,14 @@ def test_sin_fuga_de_puertos_ni_hilos_en_20_ciclos(tunnel_env):
         with open_tunnel(ssh, rs) as forwarder:
             puertos.append(forwarder.local_bind_port)
 
-    time.sleep(1.0)
+    # Se espera a que los hilos bajen en vez de asumir que ya bajaron: paramiko cierra
+    # los suyos de forma asincrona y en una maquina cargada tarda mas. El limite se
+    # mantiene estricto; lo que se tolera es la lentitud, no la fuga.
+    for _ in range(50):
+        if threading.active_count() - hilos_antes <= 5:
+            break
+        time.sleep(0.2)
+
     hilos_despues = threading.active_count()
     assert hilos_despues - hilos_antes <= 5, (
         f"posible fuga de hilos: {hilos_antes} -> {hilos_despues}"
