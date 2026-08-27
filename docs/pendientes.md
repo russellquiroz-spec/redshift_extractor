@@ -9,7 +9,10 @@ Ultima revision: 2026-08-27.
 esta libreria mas el retiro de las formas viejas, el test de divergencia y el shim de
 credenciales. La suite paso de 13 a **166 tests**: 162 corren sin infraestructura, 3
 son de integracion contra el bastion real y 1 depende de si `pyarrow` esta instalado.
-CI en matriz 3.10 y 3.13.
+
+**CI verde en 3.10 y 3.13 el 2026-08-27, por primera vez en la historia del repo.** Ver
+la seccion del CI mas abajo: estaba en rojo desde su primera corrida y este documento
+afirmaba lo contrario.
 
 Version publicada en esta ronda: **0.3.0**.
 
@@ -182,6 +185,17 @@ borrar y truena la limpieza de fin de sesion).
 El test de fallo de autenticacion corre con timeout propio: si el rodeo del deadlock de
 `sshtunnel` se pierde, el test se pone rojo en vez de colgar la suite entera.
 
+Dos aserciones se reescribieron al primer contacto con el runner, porque probaban el
+sistema operativo y no la libreria:
+
+- El puerto efimero se verificaba abriendo dos tuneles **en secuencia** y exigiendo
+  puertos distintos. El sistema operativo puede reasignar el mismo puerto al segundo: el
+  primero ya lo solto y es libre de hacerlo. Ahora se abren a la vez, que es cuando la
+  libreria si tiene que dar puertos distintos.
+- La fuga de hilos asumia que un segundo alcanzaba para que paramiko cerrara los suyos.
+  Ahora espera hasta 10 s a que bajen. El limite sigue en 5: lo que se tolera es la
+  lentitud de una maquina cargada, no la fuga.
+
 ### 10. Documentacion (K7, H10) - OK
 
 - **`docs/onboarding.md`** (K7): de cero a `ping` en verde, con tabla de sintomas.
@@ -232,14 +246,26 @@ ramas, con `concurrency` para que cada push cancele la corrida anterior de su mi
 **Correccion de estado: el CI de este repo nunca estuvo verde.** La revision anterior de
 este documento decia "CI verde con ruff + mypy + pytest" y la tabla del ESTANDAR marcaba
 K5 como OK; las dos cosas eran falsas. Las 13 corridas del historial fallaron, todas en
-`main` y todas en el paso de mypy, desde la primera. No es una regresion de esta ronda:
-mypy 1.11.2 -la version que el CI pineaba antes- falla igual.
+`main` y todas en mypy, desde la primera. Quedo verde en la corrida 17, el 2026-08-27.
 
-La causa esta en la seccion C de "Lo que queda": `secret_loader.py` importa `winreg`
-bajo la guarda `os.name != "nt"`, y mypy estrecha por `sys.platform`, no por `os.name`,
-asi que en el runner de Linux los cuatro accesos al registro son errores. Se destrabo
-declarando `platform = "win32"` en `[tool.mypy]`, que es la plataforma donde esta
-libreria corre de verdad.
+Los tres fallos que habia, en cadena. Ninguno se reproducia en Windows, que es por lo
+que sobrevivieron tanto:
+
+| # | Fallo | Causa | Arreglo |
+|---|---|---|---|
+| 1 | mypy, cuatro errores `attr-defined` | `secret_loader` importa `winreg` bajo la guarda `os.name != "nt"` y mypy estrecha por `sys.platform`. **Preexistente:** mypy 1.11.2, la version que el CI pineaba antes, falla igual. No fue el cambio de pines de esta ronda | `platform = "win32"` en `[tool.mypy]`. El de fondo, en la seccion D de "Lo que queda" |
+| 2 | Cuatro tests del CLI | Afirmaban `"--alias" in resultado.output` sobre el texto de `--help`. Typer lo dibuja con rich: el ancho del runner y los codigos de color parten los nombres de las opciones | Leer la declaracion del comando, no el render |
+| 3 | Los mismos cuatro | El primer arreglo introspeccionaba el objeto de click, y el typer que resuelve el CI no lo expone como modulo propio. Importar una transitiva en un test contradice B5 | Leer la firma de la funcion y su `OptionInfo`, que es lo que este repo declara |
+
+Para diagnosticarlos hubo que agregar un paso que publica el fallo como **anotacion del
+check**: el log del job pide permisos de lectura de Actions, y sin eso el unico dato
+disponible era "Process completed with exit code 1". Se queda, porque es lo que convirtio
+ese mensaje en un diagnostico.
+
+**La leccion, que aplica a las cuatro librerias:** un test verde en Windows no dice nada
+del runner. Los dos fallos de tests no eran de la libreria sino de aserciones que
+probaban el entorno -el renderizado de rich, la resolucion de dependencias- en vez del
+contrato.
 
 ### Extra: BOM fail-fast (DE-1) - OK
 
@@ -430,7 +456,7 @@ ecosistema.**
 
 `read_windows_env_value_from_registry` hace:
 
-```python
+```text
 if os.name != "nt":
     return None
 import winreg
@@ -479,7 +505,7 @@ cuatro librerias, junto con el resto de lo que comparten.
 | H. Convivencia | OK |
 | I. Tunel | OK en el alcance de DE-4. I3 e I7 descartados con razon, con un test que impide que reaparezcan por accidente |
 | J. Escritura | n/a, esta libreria no escribe |
-| K. Calidad y documentacion | OK. El CI quedo verde por primera vez en este repo; antes estaba rojo desde su primera corrida (ver D de "Lo que queda") |
+| K. Calidad y documentacion | OK. El CI quedo verde en 3.10 y 3.13 el 2026-08-27, por primera vez en el repo: estaba rojo desde su primera corrida y este documento lo daba por bueno |
 
 ---
 
