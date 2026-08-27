@@ -202,12 +202,34 @@ def test_cli_db_ya_no_se_acepta(write_env, minimal_env, tmp_path):
     sql = tmp_path / "q.sql"
     sql.write_text("select 1", encoding="utf-8")
     resultado = runner.invoke(app, ["run-file", str(sql), "--db", "prod", "--dry-run"])
-    assert resultado.exit_code != EXIT_OK
-    assert "No such option" in resultado.output or "--db" in resultado.output
+    # 2 es el codigo de click para un error de uso: la opcion ya no existe.
+    assert resultado.exit_code == 2
+
+
+def _opciones_declaradas(comando: str) -> dict:
+    """
+    {declaracion: oculta?} de las opciones del comando, leidas de click.
+
+    Se introspecciona en vez de leer el texto de `--help` porque typer lo dibuja con
+    rich: el ancho de la terminal y los codigos de color parten los nombres, asi que
+    un `"--alias" in output` pasa en una maquina y falla en otra. Lo que el contrato
+    exige es que la opcion este declarada y visible, no como se renderiza.
+    """
+    import click
+    import typer.main
+
+    grupo = typer.main.get_command(app)
+    assert isinstance(grupo, click.Group)
+    declaradas = {}
+    for parametro in grupo.commands[comando].params:
+        for declaracion in getattr(parametro, "opts", []):
+            declaradas[declaracion] = bool(getattr(parametro, "hidden", False))
+    return declaradas
 
 
 @pytest.mark.parametrize("comando", ["ping", "fingerprint", "run", "run-file"])
-def test_cli_todo_comando_con_alias_lo_muestra_en_el_help(comando):
-    resultado = runner.invoke(app, [comando, "--help"])
-    assert "--alias" in resultado.output
-    assert "--db" not in resultado.output
+def test_cli_todo_comando_con_alias_declara_alias_visible_y_no_db(comando):
+    opciones = _opciones_declaradas(comando)
+    assert "--alias" in opciones, opciones
+    assert opciones["--alias"] is False, "--alias debe salir en el --help"
+    assert "--db" not in opciones, "--db se retiro en 0.3.0"
