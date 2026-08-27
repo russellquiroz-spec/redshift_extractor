@@ -118,8 +118,8 @@ extra da un `ImportError` que dice el comando exacto:
 pip install "redshift-extractor[parquet]"
 ```
 
-**Esto rompe a quien dependia de que viniera incluido.** Va anunciado en el README y
-en el `CHANGELOG` de la version.
+**Esto rompe a quien dependia de que viniera incluido.** Va anunciado en el README y en
+`CHANGELOG.md`.
 
 ---
 

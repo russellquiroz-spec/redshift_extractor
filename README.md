@@ -40,6 +40,9 @@ findstr /s /n /c:"--db" *.ps1 *.bat *.cmd
 `alias` es el nombre canonico del concepto en las cuatro librerias del ecosistema que
 conectan a una fuente. El cambio viene de la decision DE-2 del `ESTANDAR.md`.
 
+La lista completa de la version, con lo que agrega y lo que arregla, esta en
+`CHANGELOG.md`.
+
 **Otros dos cambios que rompen:**
 
 - `pyarrow` salio de las dependencias duras y vive en el extra `parquet`. Si guardas
