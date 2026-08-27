@@ -219,14 +219,27 @@ todos los nombres publicos (`parse_credentials_secret`, `resolve_secret_referenc
 etc.). Quien importaba desde `redshift_extractor.credentials` tiene que cambiar el
 import; hay un test que comprueba que el modulo ya no existe.
 
-### Extra: CI en matriz (K5) - OK
+### Extra: CI en matriz y en todas las ramas (K5) - OK
 
 De una sola version a matriz `3.10` y `3.13` con `fail-fast: false`, instalando
 `.[dev,parquet]` y excluyendo `integration`. Un `requires-python = ">=3.10"` que nadie
 corria en su piso era un piso sin verificar.
 
-El leg de 3.10 lo verifica el CI: en esta maquina solo hay 3.12 y 3.13. Los archivos del
-repo se revisaron contra la sintaxis de 3.10 con `ast.parse(feature_version=(3,10))`.
+El trigger tambien cambio: escuchaba `push` solo en `main`, asi que una rama de trabajo
+no disparaba nada y el fallo se descubria al abrir el PR. Ahora corre en todas las
+ramas, con `concurrency` para que cada push cancele la corrida anterior de su mismo ref.
+
+**Correccion de estado: el CI de este repo nunca estuvo verde.** La revision anterior de
+este documento decia "CI verde con ruff + mypy + pytest" y la tabla del ESTANDAR marcaba
+K5 como OK; las dos cosas eran falsas. Las 13 corridas del historial fallaron, todas en
+`main` y todas en el paso de mypy, desde la primera. No es una regresion de esta ronda:
+mypy 1.11.2 -la version que el CI pineaba antes- falla igual.
+
+La causa esta en la seccion C de "Lo que queda": `secret_loader.py` importa `winreg`
+bajo la guarda `os.name != "nt"`, y mypy estrecha por `sys.platform`, no por `os.name`,
+asi que en el runner de Linux los cuatro accesos al registro son errores. Se destrabo
+declarando `platform = "win32"` en `[tool.mypy]`, que es la plataforma donde esta
+libreria corre de verdad.
 
 ### Extra: BOM fail-fast (DE-1) - OK
 
@@ -410,6 +423,46 @@ cuidar es no cambiar el comportamiento de quien ya tiene `%` literales en su SQL
 **Senal:** la primera consulta cuyo filtro venga de fuera del codigo. Hoy todas las
 llamadas conocidas son SQL fijo o fechas generadas.
 
+### D. La guarda de plataforma de `secret_loader.py` (ecosistema)
+
+**Estado: PARCIAL. Destrabado por configuracion aqui; el arreglo de fondo es del
+ecosistema.**
+
+`read_windows_env_value_from_registry` hace:
+
+```python
+if os.name != "nt":
+    return None
+import winreg
+... winreg.HKEY_CURRENT_USER ...
+```
+
+En tiempo de ejecucion es correcto. Para mypy no: estrecha la plataforma por
+`sys.platform`, no por `os.name`, asi que al typechequear para Linux los accesos a
+`winreg` son cuatro errores `attr-defined`. Es lo que tenia el CI de este repo en rojo
+desde su primera corrida.
+
+**Arreglo de fondo, dos lineas:** cambiar la guarda a `sys.platform != "win32"`. Es
+equivalente en CPython sobre Windows (`os.name == "nt"` si y solo si
+`sys.platform == "win32"`) y mypy si lo entiende.
+
+**Por que no se hizo aqui:** `secret_loader.py` es copia identica en las cuatro
+librerias del ecosistema (D5) y `tests/test_divergencia.py` lo comprueba. Cambiarlo solo
+en este repo lo desalinea de las tres hermanas y pone rojo ese test, que es exactamente
+lo que se acaba de construir para evitar. El cambio va en las cuatro a la vez o no va.
+
+**Mientras tanto:** `platform = "win32"` en `[tool.mypy]`, con el porque escrito en el
+`pyproject.toml`. No esconde nada relevante: la libreria corre en Windows y todo lo que
+importa en Linux -tunel, config, eventos- se typechequea igual, porque sus APIs existen
+en las dos plataformas.
+
+**Se sospecha que las hermanas tienen el mismo problema.** La referencia comparte el
+archivo y tambien corre mypy sobre Linux sin declarar plataforma, asi que su CI deberia
+estar fallando por lo mismo. Vale revisarlo antes de tocar las cuatro copias.
+
+**Senal:** ninguna, es barato. Conviene hacerlo en la proxima pasada que toque a las
+cuatro librerias, junto con el resto de lo que comparten.
+
 ---
 
 ## Estado por seccion del estandar
@@ -426,7 +479,7 @@ llamadas conocidas son SQL fijo o fechas generadas.
 | H. Convivencia | OK |
 | I. Tunel | OK en el alcance de DE-4. I3 e I7 descartados con razon, con un test que impide que reaparezcan por accidente |
 | J. Escritura | n/a, esta libreria no escribe |
-| K. Calidad y documentacion | OK |
+| K. Calidad y documentacion | OK. El CI quedo verde por primera vez en este repo; antes estaba rojo desde su primera corrida (ver D de "Lo que queda") |
 
 ---
 
