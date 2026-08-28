@@ -203,7 +203,10 @@ def test_cli_db_ya_no_se_acepta(write_env, minimal_env, tmp_path):
     sql = tmp_path / "q.sql"
     sql.write_text("select 1", encoding="utf-8")
     resultado = runner.invoke(app, ["run-file", str(sql), "--db", "prod", "--dry-run"])
-    # 2 es el codigo de click para un error de uso: la opcion ya no existe.
+    # 2 es el codigo con el que click sale por su cuenta ante un error de uso: la opcion
+    # ya no existe. `CliRunner` invoca `app` directamente, asi que no pasa por `main()`,
+    # que es donde F4 traduce ese 2 a `EXIT_USAGE` (64). Por el entry point real este
+    # mismo caso sale con 64; lo cubre `tests/test_cli.py`.
     assert resultado.exit_code == 2
 
 

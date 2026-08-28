@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "redshift-extractor"
-version = "0.3.0"
+version = "0.4.0"
 description = "Internal library to extract data from Amazon Redshift via SSH tunnel"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -45,7 +45,9 @@ dev = [
 
 # CLI opcional (si vas a usar cli.py)
 [project.scripts]
-redshift-extractor = "redshift_extractor.cli:app"
+#: `:main` y no `:app`: la separacion del codigo de uso (64) del de config (2) vive en
+#: `main()`. Apuntar a `app` la saltaria y los dos volverian a salir con 2.
+redshift-extractor = "redshift_extractor.cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
@@ -69,20 +71,17 @@ select = ["E4", "E7", "E9", "F"]
 [tool.mypy]
 python_version = "3.10"
 files = ["src/redshift_extractor"]
-# Se typechequea para Windows, que es donde corre esta libreria: la resolucion de
-# credenciales cae al registro de Windows y el env se escribe desde PowerShell. El
-# runner del CI es Linux solo porque es lo barato.
+# Sin `platform` declarado a proposito: mypy typechequea para la plataforma en la que
+# corre, y pasa en las dos. Aqui hubo un `platform = "win32"` que existia solo para
+# tapar cuatro errores `attr-defined` sobre `winreg` al correr en Linux —el CI—, porque
+# `secret_loader` guardaba el import con `os.name != "nt"` y mypy estrecha por
+# `sys.platform`, no por `os.name`. Esa fue la razon de que el CI estuviera en rojo
+# desde su primera corrida.
 #
-# Sin esto, `secret_loader.read_windows_env_value_from_registry` da cuatro errores en
-# Linux: importa `winreg` bajo la guarda `os.name != "nt"`, y mypy estrecha por
-# `sys.platform`, no por `os.name`. Es la razon por la que el CI de este repo estuvo
-# en rojo desde su primera corrida.
-#
-# El arreglo de fondo es cambiar esa guarda a `sys.platform != "win32"` en
-# `secret_loader.py`, pero ese archivo es copia identica en las cuatro librerias del
-# ecosistema (D5) y `tests/test_divergencia.py` lo comprueba: tocarlo aqui solo lo
-# desalinea. Va cuando se haga en las cuatro. Ver docs/pendientes.md.
-platform = "win32"
+# El arreglo de fondo ya esta en las cuatro librerias del ecosistema: la guarda es
+# `sys.platform != "win32"`, que mypy si entiende y que en runtime hace exactamente lo
+# mismo. Sin el workaround, el typecheck vuelve a cubrir el codigo especifico de
+# Windows en vez de darlo por bueno.
 ignore_missing_imports = true
 disallow_untyped_defs = true
 no_implicit_optional = true

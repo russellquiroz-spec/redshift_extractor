@@ -166,3 +166,175 @@ def test_emit_manda_al_logger_propio_y_no_al_root():
 
     assert any("al logger propio" in mensaje for mensaje in handler.mensajes)
     assert (root.level, list(root.handlers)) == antes
+
+
+# -----------------------------------------------------------------------------
+# G1 / pendiente F: la secuencia de eventos, no solo el catalogo
+# -----------------------------------------------------------------------------
+def _extraccion_con_eventos(monkeypatch, tmp_path, collect, **kwargs):
+    """
+    Corre `extract_sql` de punta a punta contra el tunel de prueba, con la consulta
+    simulada.
+
+    `tests/fakepg.py` contesta el handshake del protocolo pero no ejecuta SQL, asi que
+    la conexion y el `read_sql` se sustituyen. Todo lo demas —resolucion del alias,
+    tunel real con su handshake SSH, cierre— corre de verdad, que es lo que hace falta
+    para ver la secuencia completa.
+    """
+    import pandas as pd
+
+    from redshift_extractor import extractor as extractor_mod
+
+    class _ConexionFalsa:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(extractor_mod, "_connect", lambda rs, puerto: _ConexionFalsa())
+    monkeypatch.setattr(
+        extractor_mod.pd, "read_sql", lambda sql, conn: pd.DataFrame({"a": [1, 2]})
+    )
+    return extractor_mod.extract_sql("select 1", on_event=collect, **kwargs)
+
+
+def test_tunnel_start_se_emite_una_sola_vez(tunnel_env, events_log, monkeypatch, tmp_path):
+    """
+    Habia dos emisores de `TUNNEL_START` para el mismo tunel: `extractor.extract_sql` y
+    `tunnel.open_tunnel`. Quien midiera TUNNEL_START -> TUNNEL_READY para sacar latencia
+    del tunel arrancaba el cronometro en el evento equivocado.
+    """
+    collected, collect = events_log
+    tunnel_env()
+
+    _extraccion_con_eventos(monkeypatch, tmp_path, collect)
+
+    eventos = [e["event"] for e in collected]
+    assert eventos.count("TUNNEL_START") == 1, eventos
+    assert eventos.count("TUNNEL_READY") == 1, eventos
+
+
+def test_el_tunnel_start_que_queda_trae_el_puerto_y_el_alias(
+    tunnel_env, events_log, monkeypatch, tmp_path
+):
+    """Se conservo el de `tunnel.py`, que es el unico que conoce el puerto local."""
+    collected, collect = events_log
+    tunnel_env()
+
+    _extraccion_con_eventos(monkeypatch, tmp_path, collect)
+
+    evento = next(e for e in collected if e["event"] == "TUNNEL_START")
+    assert evento["alias"] == "prod"
+    assert evento["redshift_dbname"] == "analytics"
+    assert "local_port" in evento
+    assert "ssh_host" in evento
+
+
+def test_query_start_se_emite_una_sola_vez_con_persistencia(
+    tunnel_env, events_log, monkeypatch, tmp_path
+):
+    """
+    El aviso de "guardado activado" salia como `QUERY_START`, asi que una extraccion
+    con persistencia reportaba dos consultas donde hubo una.
+    """
+    collected, collect = events_log
+    tunnel_env()
+
+    _extraccion_con_eventos(
+        monkeypatch,
+        tmp_path,
+        collect,
+        save_dir=str(tmp_path / "salida"),
+        base_name="prueba",
+        save_csv=True,
+    )
+
+    eventos = [e["event"] for e in collected]
+    assert eventos.count("QUERY_START") == 1, eventos
+    assert eventos.count("SAVE_CONFIGURED") == 1, eventos
+    assert eventos.count("QUERY_OK") == 1, eventos
+    assert eventos.count("FILE_SAVED") == 1, eventos
+
+
+def test_save_configured_esta_en_el_catalogo_y_trae_su_alias(
+    tunnel_env, events_log, monkeypatch, tmp_path
+):
+    collected, collect = events_log
+    tunnel_env()
+
+    _extraccion_con_eventos(
+        monkeypatch,
+        tmp_path,
+        collect,
+        save_dir=str(tmp_path / "salida"),
+        base_name="prueba",
+        save_csv=True,
+    )
+
+    evento = next(e for e in collected if e["event"] == "SAVE_CONFIGURED")
+    assert "SAVE_CONFIGURED" in events_mod.KNOWN_EVENTS
+    assert evento["alias"] == "prod"
+    assert evento["save_csv"] is True
+
+
+def test_todo_evento_emitido_esta_en_el_catalogo(
+    tunnel_env, events_log, monkeypatch, tmp_path
+):
+    collected, collect = events_log
+    tunnel_env()
+
+    _extraccion_con_eventos(
+        monkeypatch,
+        tmp_path,
+        collect,
+        save_dir=str(tmp_path / "salida"),
+        base_name="prueba",
+        save_csv=True,
+    )
+
+    desconocidos = {e["event"] for e in collected} - events_mod.KNOWN_EVENTS
+    assert not desconocidos, f"eventos fuera del catalogo: {desconocidos}"
+
+
+# -----------------------------------------------------------------------------
+# Pendiente H: el UserWarning de pandas no se filtra a consola
+# -----------------------------------------------------------------------------
+def test_read_sql_no_deja_salir_el_warning_de_sqlalchemy(recwarn):
+    """
+    `pd.read_sql` sobre una conexion DBAPI2 avisa "pandas only supports SQLAlchemy
+    connectable". No indica nada malo -la ruta DBAPI2 es la que esta libreria eligio a
+    proposito, para no arrastrar SQLAlchemy- pero ensuciaba la salida del host en cada
+    extraccion, por CLI y por API.
+    """
+    from redshift_extractor import extractor as extractor_mod
+
+    class _ConexionDBAPI2:
+        """Suficiente para que pandas la tome por DBAPI2 y dispare el aviso."""
+
+        def cursor(self):
+            raise AssertionError("no se llega aca: el warning sale antes")
+
+    with pytest.raises(Exception):
+        extractor_mod._read_sql_sin_el_warning_de_sqlalchemy("select 1", _ConexionDBAPI2())
+
+    sqlalchemy = [w for w in recwarn if "SQLAlchemy connectable" in str(w.message)]
+    assert not sqlalchemy, f"el warning se filtro: {[str(w.message) for w in sqlalchemy]}"
+
+
+def test_el_filtro_de_warnings_no_toca_la_configuracion_del_host():
+    """
+    Se usa `catch_warnings`, que restaura el estado al salir. Un filtro global tocaria
+    la configuracion de warnings del host, que es lo que C3 prohibe para el logging y
+    aplica igual aqui.
+    """
+    import warnings as warnings_mod
+
+    from redshift_extractor import extractor as extractor_mod
+
+    class _ConexionDBAPI2:
+        def cursor(self):
+            raise AssertionError("no se llega aca")
+
+    antes = list(warnings_mod.filters)
+    with pytest.raises(Exception):
+        extractor_mod._read_sql_sin_el_warning_de_sqlalchemy("select 1", _ConexionDBAPI2())
+
+    assert list(warnings_mod.filters) == antes

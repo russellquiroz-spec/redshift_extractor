@@ -264,6 +264,45 @@ Notas sobre `query_file`:
 - Si el archivo no existe, lanza `FileNotFoundError`.
 - `query` tiene prioridad sobre `query_file` (si ambos se proporcionan, se usa `query`).
 
+### Valores variables: `params`, nunca f-strings
+
+Cuando la consulta lleva valores que cambian, van en `params` y los enlaza psycopg2. El
+marcador es `%(nombre)s`:
+
+```python
+df = extract_sql(
+    "select * from ventas where ruta_id = %(ruta)s and fecha >= %(desde)s",
+    params={"ruta": ruta_id, "desde": "2026-01-01"},
+    alias="prod",
+)
+```
+
+Funciona igual con `query_file`, asi que un `.sql` versionado puede llevar sus
+marcadores y recibir los valores desde el codigo.
+
+**Es obligatorio en cuanto un valor venga de fuera del codigo** —un filtro de un
+dashboard, un argumento de linea de comandos, algo que teclee una persona—. Armar el SQL
+con `format` o f-strings ahi es inyeccion de SQL:
+
+```python
+# MAL si `ruta` viene de fuera: "1; drop table ventas--" se ejecuta.
+df = extract_sql(f"select * from ventas where ruta_id = {ruta}")
+
+# BIEN: el valor viaja aparte y nunca se convierte en SQL.
+df = extract_sql("select * from ventas where ruta_id = %(ruta)s", params={"ruta": ruta})
+```
+
+Con valores generados en el propio codigo —fechas de un `pd.date_range`, por ejemplo—
+interpolar es inofensivo, y es lo que hace el patron de "Extracciones grandes".
+
+El marcador es `%(nombre)s` y no `:nombre` como en `postgres_local_client`, que usa
+SQLAlchemy. La razon es Redshift: `::` es el operador de cast y sale en casi cualquier
+query real, asi que traducir `:nombre` obligaria a distinguirlo del cast y de los `:`
+dentro de cadenas literales.
+
+Si no pasas `params`, no cambia nada: el SQL se manda tal cual y los `%` literales que
+ya tengas (`like '%rabbit%'`, `to_char(fecha, '%Y')`) siguen funcionando igual.
+
 ### Rutas: relativas, absolutas y home directory
 
 **Opcion 1: Ruta relativa (respecto al current working directory)**
@@ -430,6 +469,10 @@ Cada llamada abre y cierra su propio tunel. Para muchos trozos eso cuesta ~1 s p
 iteracion; si llega a molestar, es la senal de reabrir el reuso de tunel (I3), que DE-4
 dejo fuera de esta libreria.
 
+Las fechas van interpoladas con `format` porque las genera `pd.date_range` en el propio
+codigo, no una entrada de usuario. Si en tu caso el rango viniera de fuera, usa `params`
+(ver "Valores variables") en vez de `format`.
+
 --------------------------------------------------------------------------------
 ERRORES
 --------------------------------------------------------------------------------
@@ -484,6 +527,25 @@ clave `"alias"` que devuelve `ping()`.
 
 Los nombres de los eventos (`TUNNEL_START`, `QUERY_OK`, ...) no cambiaron: los hosts
 filtran por esas cadenas. El catalogo completo esta en `events.KNOWN_EVENTS`.
+
+La secuencia de una extraccion con persistencia es esta, y cada evento sale **una sola
+vez**:
+
+```text
+CONFIG_LOADED, ALIAS_RESOLVED, SAVE_CONFIGURED, TUNNEL_START, TUNNEL_READY,
+DB_CONNECT_START, DB_CONNECTED, QUERY_START, QUERY_OK, FILE_SAVED,
+CONNECTION_CLOSED, TUNNEL_CLOSED, DONE
+```
+
+`FILE_SAVED` sale una vez por archivo escrito: con `save_csv=True` y `save_parquet=True`
+son dos.
+
+`SAVE_CONFIGURED` anuncia que el guardado quedo activado y trae `save_dir`, `base_name`,
+`save_csv` y `save_parquet`. Antes se emitia como `QUERY_START`, asi que quien contara
+consultas veia dos donde hubo una; lo mismo pasaba con `TUNNEL_START`, que tenia dos
+emisores para el mismo tunel. Si filtras por `QUERY_START` o mides
+`TUNNEL_START` -> `TUNNEL_READY` para sacar latencia, revisa que no estes compensando
+esa duplicacion.
 
 Un `on_event` que lanza excepcion no tumba la operacion en curso: se registra en DEBUG
 en el logger propio y se sigue adelante.
@@ -560,10 +622,26 @@ quien lo administra y pegarlo en `SSH_HOST_FINGERPRINT`.
 | 1 | Error de negocio (SQL, argumentos incompatibles) |
 | 2 | Error de configuracion |
 | 3 | Error de tunel |
+| 64 | Error de uso de la linea de comandos: flag mal escrito, argumento faltante, subcomando inexistente |
+| 130 | Interrumpido con Ctrl+C |
+
+El **64** (`EX_USAGE` de `sysexits.h`) se separo del 2 a proposito. Antes los dos salian
+con 2, porque es el codigo con el que click sale por su cuenta ante un error de uso:
+
+```powershell
+redshift-extractor ls --alais prod   # typo en el flag  -> antes 2, ahora 64
+redshift-extractor ls                # .env roto        -> 2, como siempre
+```
+
+Un script que trate el 2 como "revisa el `.env`" se equivocaba ante cualquier typo en el
+comando. Si tienes tareas programadas que revisan el codigo de salida, **el 2 ahora
+significa solo configuracion**; agrega el 64 donde antes lo cubrias con el 2.
 
 ### run-file
 
 Ejecuta un archivo `.sql` directamente. Por defecto envuelve el query con `LIMIT 10` para una prueba rapida (solo aplica a `SELECT`/`WITH`); usa `--full` para el query completo.
+
+Para decidir si puede envolver el SQL, se mira la primera palabra **saltando los comentarios de encabezado**, tanto `--` como `/* */`: un archivo que arranca documentado —que es como se escriben todos— entra al modo prueba sin problema. El SQL que se ejecuta es el original, con sus comentarios intactos.
 
 ```powershell
 redshift-extractor run-file query.sql --alias prod                       # prueba: LIMIT 10

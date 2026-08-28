@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+import warnings
 from datetime import datetime as dt
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
@@ -33,6 +34,7 @@ EventType = Literal[
     "DB_CONNECTED",
     "QUERY_START",
     "QUERY_OK",
+    "SAVE_CONFIGURED",
     "FILE_SAVED",
     "CONNECTION_CLOSED",
     "DONE",
@@ -86,6 +88,36 @@ def _connect(rs: RedshiftConfig, local_port: int) -> Any:
         raise _query_error(exc) from exc
 
 
+def _read_sql_sin_el_warning_de_sqlalchemy(
+    sql: str, conn: Any, params: Optional[Dict[str, Any]] = None
+) -> pd.DataFrame:
+    """
+    `pd.read_sql` sobre una conexion DBAPI2, sin el `UserWarning` de pandas.
+
+    pandas avisa que "solo soporta SQLAlchemy connectable" ante cualquier conexion
+    DBAPI2. No indica nada malo: la ruta DBAPI2 funciona y es la que esta libreria
+    eligio a proposito para no arrastrar SQLAlchemy. Pero salia en cada extraccion, por
+    CLI y por API, y ensuciaba la salida del host.
+
+    El filtro va acotado a esta llamada y a ese mensaje, con `catch_warnings`, que
+    restaura el estado al salir. Un filtro global tocaria la configuracion de warnings
+    del host, que es justo lo que C3 prohibe para el logging y aplica igual aqui.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="pandas only supports SQLAlchemy connectable",
+            category=UserWarning,
+        )
+        # Sin `params` la llamada va exactamente como iba antes. No es cosmetico:
+        # psycopg2 solo interpreta `%` cuando recibe parametros, asi que pasar
+        # `params=None` explicito le cambiaria el significado a un SQL con `%` literales
+        # -un `like '%algo%'`, un `to_char(x, '%Y')`- que hoy funciona.
+        if params is None:
+            return pd.read_sql(sql, conn)
+        return pd.read_sql(sql, conn, params=params)
+
+
 def _query_error(exc: psycopg2.Error) -> QueryError:
     msg = f"{exc}"
     pgcode = getattr(exc, "pgcode", None)
@@ -103,6 +135,7 @@ def extract_sql(
     *,
     alias: Optional[str] = None,
     query_file: Optional[str] = None,
+    params: Optional[Dict[str, Any]] = None,
     on_event: Optional[OnEvent] = None,
     save_dir: Optional[str] = None,
     base_name: Optional[str] = None,
@@ -126,6 +159,26 @@ def extract_sql(
       - alias: alias del cluster. Keyword-only; si se omite, se usa `DEFAULT_ALIAS`
         del env propio.
       - query_file: ruta a un archivo .sql (usado si query es None).
+      - params: valores a enlazar, **nunca por interpolacion de texto**. Los enlaza
+        psycopg2, con su marcador nativo `%(nombre)s`:
+
+            extract_sql(
+                "select * from ventas where ruta_id = %(ruta)s and fecha >= %(desde)s",
+                params={"ruta": ruta_id, "desde": "2026-01-01"},
+            )
+
+        Es obligatorio en cuanto un valor venga de fuera del codigo -un filtro de un
+        dashboard, un argumento de linea de comandos-, porque armar el SQL con `format`
+        o f-strings ahi es inyeccion de SQL.
+
+        **Divergencia deliberada de la referencia**, que enlaza con `:nombre` porque usa
+        SQLAlchemy. Aqui el marcador es `%(nombre)s`, el de psycopg2, y no se traduce de
+        uno al otro: en Redshift `::` es el operador de cast y aparece en casi cualquier
+        query real, asi que un traductor de `:nombre` tendria que distinguirlo del cast
+        y de los `:` dentro de cadenas literales. Frágil, y sin nada que ganar.
+
+        Con `params=None` -el default- el SQL se manda tal cual y los `%` literales que
+        alguien ya tenga en su query siguen funcionando igual.
 
     Persistencia opcional:
       - save_dir: carpeta destino (si None, no guarda nada)
@@ -157,16 +210,11 @@ def extract_sql(
         alias=resolved,
     )
 
-    emit(
-        on_event,
-        level="INFO",
-        event="TUNNEL_START",
-        message="Establishing SSH tunnel.",
-        alias=resolved,
-        redshift_host=rs.host,
-        redshift_port=rs.port,
-        redshift_dbname=rs.dbname,
-    )
+    # `TUNNEL_START` lo emite `tunnel.open_tunnel`, que es el unico que conoce el puerto
+    # local. Aqui habia un segundo emisor del mismo evento para el mismo tunel, con
+    # campos distintos, asi que quien midiera TUNNEL_START -> TUNNEL_READY para sacar
+    # latencia arrancaba el cronometro en el evento equivocado. `alias` y
+    # `redshift_dbname` se mudaron alla para no perderlos.
 
     # Normaliza logica de guardado
     want_save = bool(save_dir) and (save_csv or save_parquet)
@@ -179,11 +227,16 @@ def extract_sql(
         csv_path = out_dir / f"{bn}.csv"
         pq_path = out_dir / f"{bn}.parquet"
 
+        # `SAVE_CONFIGURED`, no `QUERY_START`: esto anuncia que el guardado quedo
+        # activado, no que empiece una consulta. Iba con el nombre equivocado y sin
+        # `alias`, asi que un host que contara `QUERY_START` reportaba dos consultas
+        # donde hubo una.
         emit(
             on_event,
             level="INFO",
-            event="QUERY_START",
+            event="SAVE_CONFIGURED",
             message="Output persistence enabled.",
+            alias=resolved,
             save_dir=str(out_dir),
             base_name=bn,
             save_csv=save_csv,
@@ -191,7 +244,7 @@ def extract_sql(
         )
 
     try:
-        with open_tunnel(ssh, rs, on_event=on_event) as tunnel:
+        with open_tunnel(ssh, rs, on_event=on_event, alias=resolved) as tunnel:
             conn = None
             try:
                 emit(
@@ -222,7 +275,7 @@ def extract_sql(
                     alias=resolved,
                 )
 
-                df = pd.read_sql(final_query, conn)
+                df = _read_sql_sin_el_warning_de_sqlalchemy(final_query, conn, params)
 
                 emit(
                     on_event,
@@ -336,7 +389,7 @@ def ping(
     _app, ssh, resolved, rs = _config.resolve(alias, on_event=on_event)
     started = time.perf_counter()
 
-    with open_tunnel(ssh, rs, on_event=on_event) as tunnel:
+    with open_tunnel(ssh, rs, on_event=on_event, alias=resolved) as tunnel:
         tunnel_port = int(tunnel.local_bind_port)
         conn = _connect(rs, tunnel_port)
         try:

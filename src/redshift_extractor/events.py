@@ -39,6 +39,9 @@ KNOWN_EVENTS = frozenset(
         "DB_CONNECTED",
         "QUERY_START",
         "QUERY_OK",
+        #: El guardado quedo activado. No es el inicio de una consulta: antes se
+        #: emitia como `QUERY_START` y desbalanceaba la cuenta de consultas.
+        "SAVE_CONFIGURED",
         "FILE_SAVED",
         "CONNECTION_CLOSED",
         "DONE",

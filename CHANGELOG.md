@@ -3,6 +3,116 @@
 Este archivo empieza en 0.3.0. Para lo anterior, el historico de commits: hasta 0.1.0 el
 proyecto no llevaba changelog.
 
+## 0.4.0 - 2026-08-27
+
+Cierra los cuatro hallazgos de la validacion funcional del 2026-08-27 (E, F, G, H de
+`docs/pendientes.md`), F4 -que llego desde `mongo_extractor`- y los dos que quedaban de
+la lista original: C (`params` enlazados) y D (la guarda de plataforma de
+`secret_loader`). Con esto `docs/pendientes.md` no tiene trabajo abierto: lo que queda
+son dos decisiones ya tomadas, con su senal escrita.
+
+Menor y no parche porque hay cambios que rompen, aunque solo a quien consuma eventos o
+codigos de salida; la tabla esta abajo. Para quien llame `extract_sql` o use el CLI a
+mano no cambia nada.
+
+### Arregla
+
+- **El modo prueba de `run-file` ya acepta archivos con encabezado de comentarios.**
+  `apply_limit` decidia si podia envolver el SQL con `LIMIT` mirando la primera palabra
+  del archivo sin quitar comentarios, asi que cualquier `.sql` que empezara con
+  `-- ...` —o sea, cualquier query documentada— entregaba `--` como primera palabra y se
+  rechazaba con "El modo LIMIT solo funciona con SELECT/WITH". Como el modo prueba es el
+  **default** del comando, el workaround era `--full`, justo lo que ese modo existe para
+  evitar. Ahora la nueva `cli.first_keyword()` salta comentarios de linea y de bloque
+  antes de tomar el primer token; el SQL que se ejecuta sigue siendo el original, con sus
+  comentarios. El mensaje de rechazo ademas nombra la palabra que si encontro, en vez de
+  culpar al tipo de sentencia.
+
+- **`TUNNEL_START` y `QUERY_START` ya no se emiten dos veces por extraccion.** El
+  catalogo y los campos estaban bien; lo que nadie habia revisado era la **secuencia**.
+  `TUNNEL_START` tenia dos emisores para el mismo tunel —`extract_sql` y `open_tunnel`,
+  con campos distintos cada uno—, asi que medir `TUNNEL_START` -> `TUNNEL_READY` para
+  sacar latencia arrancaba el cronometro en el evento equivocado. Se conservo el de
+  `tunnel.py`, que es el unico que conoce el puerto local, y `alias` y `redshift_dbname`
+  se mudaron alla para no perderlos.
+
+- **El `UserWarning` de pandas ya no se filtra a consola.** `pd.read_sql` sobre una
+  conexion de `psycopg2` avisaba "pandas only supports SQLAlchemy connectable" en cada
+  extraccion, por CLI y por API, y tambien al correr la suite. No indicaba nada malo —la
+  ruta DBAPI2 funciona y es la que esta libreria eligio a proposito, para no arrastrar
+  SQLAlchemy— pero ensuciaba la salida del host y entrenaba a ignorar warnings. Se
+  silencia solo ese mensaje y solo en esa llamada, con `warnings.catch_warnings()`, que
+  restaura el estado al salir: la configuracion de warnings del host no se toca.
+
+- **Los errores de uso de la linea de comandos salen con 64, no con 2** (F4). click sale
+  con 2 por su cuenta ante un flag mal escrito, un argumento obligatorio faltante o un
+  subcomando inexistente, y 2 es el codigo que el ecosistema le asigno a los errores de
+  configuracion. Un runner que tratara el 2 como "revisa el `.env`" se equivocaba ante
+  cualquier typo en el comando; F4 promete codigos estables y uno que significa dos cosas
+  no lo es. Se agrega `main()` como entry point, que separa las dos cosas sin tocar
+  estado global de click, mas el 130 para Ctrl+C. Ya estaba resuelto asi en
+  `mongo_extractor`.
+
+### Agrega
+
+- **`params` en `extract_sql`**, para enlazar valores en vez de interpolarlos. Hasta
+  ahora toda consulta con valores variables se armaba con `format` o f-strings; con
+  fechas generadas en el codigo es inofensivo, pero deja de serlo en cuanto un valor
+  venga de fuera —un filtro de un dashboard, un argumento de linea de comandos—, porque
+  entonces es inyeccion de SQL.
+
+  ```python
+  extract_sql(
+      "select * from ventas where ruta_id = %(ruta)s and fecha >= %(desde)s",
+      params={"ruta": ruta_id, "desde": "2026-01-01"},
+      alias="prod",
+  )
+  ```
+
+  El marcador es `%(nombre)s`, el nativo de psycopg2, y no `:nombre` como la referencia,
+  que usa SQLAlchemy. No se traduce de uno al otro a proposito: en Redshift `::` es el
+  operador de cast y sale en casi cualquier query real, asi que un traductor tendria que
+  distinguirlo del cast y de los `:` dentro de cadenas literales.
+
+  **No cambia nada para quien no lo use.** Con `params=None` —el default— el argumento
+  ni siquiera se le pasa a `pd.read_sql`: psycopg2 solo interpreta `%` cuando recibe
+  parametros, asi que un SQL con `%` literales (`like '%rabbit%'`, `to_char(x, '%Y')`)
+  sigue funcionando igual. Hay tests que lo fijan.
+
+- `tests/test_cli.py`: 65 tests de `cli.py`, que estaba en cero cobertura pese a ser la
+  superficie que se usa a mano y la que corre en tareas programadas. Cubre `apply_limit`,
+  `first_keyword`, `read_sql`, `strip_trailing_semicolons`, `is_connection_error`,
+  `execute_with_retries`, `print_result` y los codigos de salida del entry point real.
+
+- `tests/test_params.py`: 9 tests del enlace de parametros, incluido que un valor
+  malicioso no se convierte en SQL y que los `%` literales siguen intactos.
+
+### Interno
+
+- **Se quito el `platform = "win32"` de `[tool.mypy]`.** Existia para tapar cuatro
+  errores `attr-defined` sobre `winreg` al typechequear en Linux, que es lo que hace el
+  CI, y era la razon de que estuviera en rojo desde su primera corrida. El arreglo de
+  fondo ya esta en las cuatro librerias del ecosistema: `secret_loader` guarda el import
+  con `sys.platform != "win32"` en vez de `os.name != "nt"`, que mypy si entiende como
+  estrechamiento de plataforma y que en runtime hace exactamente lo mismo. Sin el
+  workaround, el typecheck vuelve a cubrir el codigo especifico de Windows en vez de
+  darlo por bueno. Verificado en las dos plataformas.
+
+### Rompe (solo a quien consuma eventos o codigos de salida)
+
+| Cambio | Que pasa si no se edita |
+|---|---|
+| El aviso de "guardado activado" pasa de `QUERY_START` a `SAVE_CONFIGURED` | Un filtro por `QUERY_START` deja de ver ese evento. Es lo correcto: no era el inicio de una consulta |
+| `TUNNEL_START` se emite una vez, no dos | Un contador que compensara la duplicacion ahora cuenta de menos |
+| Los errores de uso salen con 64 en vez de 2 | Un script que trataba el 2 como "error de configuracion" ahora tiene que cubrir tambien el 64. A cambio, el 2 por fin significa una sola cosa |
+| `[project.scripts]` apunta a `cli:main` y no a `cli:app` | Nada para quien usa el comando `redshift-extractor`. Quien invoque `python -c "from redshift_extractor.cli import app; app()"` se salta la separacion de codigos |
+
+`SAVE_CONFIGURED` esta en `events.KNOWN_EVENTS` y trae `alias`, `save_dir`, `base_name`,
+`save_csv` y `save_parquet`. Nada de esto afecta al CLI, que solo imprime los eventos.
+
+`open_tunnel` acepta un `alias=` keyword-only opcional, para poder emitirlo en
+`TUNNEL_START`. `open_tunnel(ssh, rs)` sigue construyendo igual.
+
 ## 0.3.0 - 2026-08-27
 
 Ronda de homologacion contra `ESTANDAR.md` del ecosistema. Cierra los once pendientes que

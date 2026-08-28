@@ -654,6 +654,7 @@ def open_tunnel(
     redshift: RedshiftConfig,
     *,
     on_event: Optional[OnEvent] = None,
+    alias: Optional[str] = None,
 ) -> Iterator[SSHTunnelForwarder]:
     """
     Abre un tunel SSH hacia el host de Redshift y expone un puerto local.
@@ -661,6 +662,10 @@ def open_tunnel(
     Sigue devolviendo el `SSHTunnelForwarder` para no romper a quien lea
     `tunnel.local_bind_port` (E8). El tunel se cierra al salir del bloque, ante
     excepcion, y tambien si el proceso muere por `Ctrl+C` o `SIGTERM` (I4).
+
+    `alias` es informativo: solo viaja en `TUNNEL_START`, que es el unico emisor de ese
+    evento desde que se quito el duplicado de `extractor.py`. Es opcional para que
+    `open_tunnel(ssh, rs)` siga construyendo igual.
     """
     started = dt.now()
     local_port = ssh.local_port
@@ -677,11 +682,13 @@ def open_tunnel(
         level="INFO",
         event="TUNNEL_START",
         message=f"Abriendo tunel SSH a {ssh.host}:{ssh.port} -> {redshift.host}:{redshift.port}.",
+        alias=alias,
         ssh_host=ssh.host,
         ssh_user=ssh.user,
         local_port=local_port or "efimero",
         redshift_host=redshift.host,
         redshift_port=redshift.port,
+        redshift_dbname=redshift.dbname,
     )
 
     forwarder = _open_forwarder(ssh, redshift.host, redshift.port, local_port)

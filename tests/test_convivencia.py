@@ -5,6 +5,7 @@ sin tener instaladas las librerias hermanas.
 
 from __future__ import annotations
 
+import ast
 import logging
 from pathlib import Path
 
@@ -44,9 +45,63 @@ def test_h3_no_hay_basicconfig_en_ningun_modulo(modulo):
     assert "basicConfig" not in _fuente(modulo)
 
 
+def _nombre_llamado(call: ast.Call) -> str:
+    """Nombre punteado de lo que se llama: `warnings.filterwarnings`, `emit`, etc."""
+    partes = []
+    nodo: ast.expr = call.func
+    while isinstance(nodo, ast.Attribute):
+        partes.append(nodo.attr)
+        nodo = nodo.value
+    if isinstance(nodo, ast.Name):
+        partes.append(nodo.id)
+    return ".".join(reversed(partes))
+
+
+def _filtros_de_warnings_permanentes(fuente: str) -> list[str]:
+    """
+    Llamadas que mutan los filtros de warnings **sin** restaurarlos al salir.
+
+    Lo que G5 prohibe es dejar el estado tocado, no usar la API: un
+    `warnings.filterwarnings(...)` dentro de un `with warnings.catch_warnings():` se
+    revierte al salir del bloque, asi que no le cambia la configuracion al host.
+    """
+    arbol = ast.parse(fuente)
+
+    protegidos: set[int] = set()
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.With) and any(
+            isinstance(item.context_expr, ast.Call)
+            and _nombre_llamado(item.context_expr).endswith("catch_warnings")
+            for item in nodo.items
+        ):
+            protegidos.update(id(hijo) for hijo in ast.walk(nodo))
+
+    permanentes = []
+    for nodo in ast.walk(arbol):
+        if not isinstance(nodo, ast.Call) or id(nodo) in protegidos:
+            continue
+        nombre = _nombre_llamado(nodo)
+        if nombre.endswith(("filterwarnings", "simplefilter", "resetwarnings")):
+            permanentes.append(f"{nombre}() en la linea {nodo.lineno}")
+    return permanentes
+
+
 @pytest.mark.parametrize("modulo", MODULOS, ids=lambda p: p.name)
 def test_g5_no_deja_filterwarnings_permanente(modulo):
-    assert "filterwarnings" not in _fuente(modulo)
+    """
+    G5: la libreria no le cambia la configuracion de warnings al host.
+
+    Se revisa por AST y no por substring, porque `extractor.py` si silencia un warning
+    concreto -el de pandas sobre conexiones DBAPI2- y lo hace dentro de
+    `catch_warnings()`, que restaura el estado al salir. Prohibir el token dejaria fuera
+    el uso correcto junto con el incorrecto.
+    """
+    permanentes = _filtros_de_warnings_permanentes(_fuente(modulo))
+    assert not permanentes, (
+        f"{modulo.name} muta los filtros de warnings sin restaurarlos: "
+        + ", ".join(permanentes)
+        + ". Envuelvelo en `with warnings.catch_warnings():`."
+    )
 
 
 def test_h4_importar_no_toca_el_root_logger():

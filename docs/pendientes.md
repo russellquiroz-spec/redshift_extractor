@@ -5,16 +5,36 @@ razon y senal de cuando conviene hacerlo.
 
 Ultima revision: 2026-08-27.
 
-**Resumen:** ronda de homologacion cerrada. Se cerraron los once pendientes que tenia
-esta libreria mas el retiro de las formas viejas, el test de divergencia y el shim de
-credenciales. La suite paso de 13 a **166 tests**: 162 corren sin infraestructura, 3
-son de integracion contra el bastion real y 1 depende de si `pyarrow` esta instalado.
+**Resumen:** ronda de homologacion cerrada, y cerrado tambien todo lo que quedaba
+pendiente de hacer. Primero se cerraron los once que tenia esta libreria, mas el retiro
+de las formas viejas, el test de divergencia y el shim de credenciales; despues los
+cuatro hallazgos de la validacion funcional (E, F, G, H), F4 -que llego desde
+`mongo_extractor`- y por ultimo C y D. La suite paso de 13 a **247 tests**: 243 corren
+sin infraestructura, 3 son de integracion contra el bastion real y 1 depende de si
+`pyarrow` esta instalado.
 
 **CI verde en 3.10 y 3.13 el 2026-08-27, por primera vez en la historia del repo.** Ver
 la seccion del CI mas abajo: estaba en rojo desde su primera corrida y este documento
 afirmaba lo contrario.
 
-Version publicada en esta ronda: **0.3.0**.
+Version publicada en la ronda de homologacion: **0.3.0**. Lo cerrado despues esta sin
+publicar; ver `CHANGELOG.md`.
+
+**Validacion funcional del 2026-08-27, despues de cerrar la ronda.** Se corrio la
+herramienta completa -CLI y API- contra el cluster de produccion con un query real de
+negocio (bono por ruta, 416 filas, 29 columnas). Todo lo homologado respondio como dice
+el README: codigos de salida, errores tipados, `ping`, aliases, persistencia CSV y
+Parquet, eventos, las cuatro formas de `query_file` y las firmas viejas truenando.
+Salieron cuatro cosas nuevas -un bug del modo prueba de `run-file` (E), eventos
+duplicados en el stream (F), `cli.py` sin pruebas (G) y un warning de pandas que se
+filtra a consola (H)-, **todas cerradas ya**; estan en "Cerrado despues de la validacion
+funcional", con la evidencia de haber reproducido cada una antes de tocarla.
+
+**Lo que sigue abierto no es trabajo, son dos decisiones ya tomadas:** A -documentar que
+garantiza la politica de dependencias en vez de guardar una evidencia que caduca- y B
+-no agregar `chunksize`/streaming/`UNLOAD`, resolverlo en el llamador partiendo por
+fechas-. Las dos tienen escrita su senal de cuando conviene reabrirlas. C y D, que si
+eran trabajo, quedaron cerradas.
 
 **Alcance de la ruptura:** 0.2.0 nunca se publico. Esta libreria pasa de 0.1.0 a 0.3.0
 en un solo salto, asi que **los hosts no tienen ventana de deprecacion**: las formas
@@ -23,6 +43,256 @@ el historico de commits. La lista completa de lo que hay que editar esta en la s
 "Cambios que rompen" y en la tabla de migracion del README.
 
 ---
+
+## Cerrado despues de la validacion funcional (post-0.3.0)
+
+Los cuatro hallazgos de la corrida contra produccion del 2026-08-27 (E, F, G, H), mas F4
+-que llego desde `mongo_extractor`- y los dos que quedaban de la lista original: C y D.
+
+**Cada uno se reprodujo antes de tocarlo**, en el venv del proyecto y no en el Python
+global; ninguno estaba ya arreglado, y la evidencia de la reproduccion esta en su
+seccion. Vale la advertencia: correr la suite con el interprete equivocado da tres
+fallos de `run-file` que no tienen nada que ver con esta libreria -son typer 0.12.5
+contra click 8.3.1, incompatibles entre si- y hacen perder el rato. El venv del proyecto
+trae typer 0.25.1 con click 8.3.3.
+
+### E. `run-file` en modo prueba rechazaba cualquier `.sql` que empezara con comentario - OK
+
+**Reproducido** el 2026-08-27 con `queries/bono_ruta_v3.sql`, el query real de negocio:
+`apply_limit(sql, 10)` -> `ValueError: El modo LIMIT solo funciona con SELECT/WITH`.
+
+`apply_limit` decidia si podia envolver el SQL mirando la primera palabra del archivo
+sin quitar comentarios, asi que cualquier query documentada entregaba `--` como primera
+palabra. Como el modo prueba es el **default** de `run-file`, el workaround era `--full`,
+justo lo que ese modo existe para evitar.
+
+**Como quedo.** Nueva `cli.first_keyword()`: consume espacios, comentarios `--` y
+comentarios `/* */` desde el inicio y se para en el primer token real. El SQL que se
+ejecuta es el original, con sus comentarios intactos; solo la decision los ignora.
+
+Sobre el `--` dentro de una cadena literal, que era el riesgo anotado: no se presenta.
+Al consumir solo el prefijo y parar en el primer token, una cadena literal nunca se
+alcanza antes de decidir. Queda un test que lo fija de todas formas.
+
+Dos correcciones que venian con el mismo bug:
+
+- El mensaje de rechazo nombra la palabra que si encontro (`empieza con 'insert'`) en
+  vez de culpar al tipo de sentencia, que era justo lo unico que no estaba mal.
+- Un archivo de puros comentarios ya no cae en el mensaje de SELECT/WITH: da
+  "no trae ninguna sentencia: solo comentarios".
+
+**Cubierto por** `tests/test_cli.py`: 28 tests, entre ellos el header de comentarios, el
+bloque `/* */`, el bloque sin cerrar, el `--` dentro de cadena, el `;` final, los
+comentarios interiores y que el rechazo de `insert`/`update` siga vivo -que antes
+pasaba por accidente, porque cualquier header lo disparaba-.
+
+### F. `QUERY_START` y `TUNNEL_START` se emitian dos veces por extraccion - OK
+
+**Reproducido** por lectura y confirmado con la secuencia capturada. Una extraccion con
+persistencia emitia:
+
+```text
+CONFIG_LOADED, ALIAS_RESOLVED, TUNNEL_START, QUERY_START, TUNNEL_START,
+TUNNEL_READY, DB_CONNECT_START, DB_CONNECTED, QUERY_START, QUERY_OK,
+FILE_SAVED, CONNECTION_CLOSED, TUNNEL_CLOSED, DONE
+```
+
+Y ahora:
+
+```text
+CONFIG_LOADED, ALIAS_RESOLVED, SAVE_CONFIGURED, TUNNEL_START, TUNNEL_READY,
+DB_CONNECT_START, DB_CONNECTED, QUERY_START, QUERY_OK, FILE_SAVED,
+CONNECTION_CLOSED, TUNNEL_CLOSED, DONE
+```
+
+**Como quedo.** Las dos causas, cada una por su lado:
+
+- El aviso de "guardado activado" pasa de `QUERY_START` a **`SAVE_CONFIGURED`**, que se
+  agrego a `KNOWN_EVENTS` y al `Literal` de `extractor.EventType`. Ademas ahora lleva
+  `alias`, que le faltaba.
+- Se borro el `TUNNEL_START` de `extract_sql`. Queda el de `tunnel.open_tunnel`, que es
+  el unico que conoce el puerto local; `alias` y `redshift_dbname` se mudaron alla para
+  no perderlos. `open_tunnel` acepta un `alias=` keyword-only opcional para recibirlo,
+  asi que `open_tunnel(ssh, rs)` sigue construyendo igual (E8). `ping()` tambien lo pasa.
+
+**Nota sobre el `FILE_SAVED` doble** que aparecia en la captura original: no era bug. Sale
+una vez por archivo escrito, y esa corrida guardo CSV y Parquet.
+
+**Cubierto por** cinco tests nuevos en `tests/test_errores_y_eventos.py`, que corren la
+extraccion completa contra el tunel de prueba -handshake SSH real- con la consulta
+sustituida, porque `tests/fakepg.py` contesta el protocolo pero no ejecuta SQL. Fijan que
+`TUNNEL_START`, `TUNNEL_READY`, `QUERY_START`, `QUERY_OK` y `SAVE_CONFIGURED` salen
+exactamente una vez, que el `TUNNEL_START` que queda trae puerto y alias, y que ningun
+evento emitido queda fuera del catalogo.
+
+**Rompe a quien consuma eventos**, y a nadie mas: un filtro por `QUERY_START` deja de ver
+el aviso de guardado, y un contador que compensara la duplicacion de `TUNNEL_START` ahora
+cuenta de menos. El CLI solo los imprime.
+
+### H. El `UserWarning` de pandas se filtraba a consola en cada corrida - OK
+
+**Reproducido** el 2026-08-27: `pd.read_sql` sobre cualquier conexion DBAPI2 emite el
+`UserWarning` de "pandas only supports SQLAlchemy connectable". Salia en cada extraccion,
+por CLI y por API, y tambien al final de cada corrida de la suite.
+
+**Como quedo.** `extractor._read_sql_sin_el_warning_de_sqlalchemy()` envuelve la llamada
+con `warnings.catch_warnings()` y silencia **ese** mensaje y **esa** categoria. Nada de
+filtros globales: la libreria no toca la configuracion de warnings del host, por el mismo
+principio de C3 con el logging.
+
+**Efecto colateral util:** la suite dejo de terminar con un `warnings summary`.
+
+**Se cruzo con un test existente.** `test_convivencia.py::test_g5_no_deja_filterwarnings_permanente`
+prohibia la cadena `filterwarnings` en cualquier modulo, por substring. El nombre dice
+"permanente", que es la propiedad que de verdad importa, pero el substring no distingue
+un filtro global de uno acotado que se revierte al salir. Se reescribio por **AST**: ahora
+busca `filterwarnings`, `simplefilter` y `resetwarnings` que **no** esten dentro de un
+`with warnings.catch_warnings():`. Verificado que sigue atrapando el uso incorrecto -filtro
+global suelto, `simplefilter` suelto y `resetwarnings`- y que permite el correcto, incluido
+el anidado.
+
+**Cubierto por** dos tests en `tests/test_errores_y_eventos.py`: que el warning no se filtra,
+y que los filtros globales quedan exactamente como estaban despues de la llamada.
+
+### G. `cli.py` no tenia pruebas - OK
+
+**Reproducido** el 2026-08-27: la unica mencion de `run_file` en toda la suite estaba en
+`test_alias_canon.py`, que comprueba por introspeccion que la opcion se llama `--alias` y
+no ejecuta el comando. Las seis funciones -`apply_limit`, `read_sql`,
+`strip_trailing_semicolons`, `is_connection_error`, `execute_with_retries` y
+`print_result`- tenian cero cobertura, y por eso E vivio hasta encontrarse a mano.
+
+**Como quedo.** `tests/test_cli.py`, **65 tests**, todos sin infraestructura. La tabla del
+pendiente original, cubierta entera:
+
+| Caso | Donde |
+|---|---|
+| `apply_limit` con header de comentarios, `;` final y `--` interiores | `test_first_keyword_*`, `test_apply_limit_*` |
+| `apply_limit` con `insert`/`update` | `test_apply_limit_sigue_rechazando_lo_que_no_es_select` |
+| `apply_limit` con `--limit 0` y negativo | `test_apply_limit_rechaza_limite_no_positivo` |
+| `read_sql` con archivo inexistente, con directorio y con UTF-8 acentuado | `test_read_sql_*` |
+| Codigos de salida del entry point real | `test_error_de_uso_sale_con_64` y companía, que es tambien el cierre de F4 |
+
+Se cubrieron ademas dos que no estaban en la lista y valen igual:
+
+- `is_connection_error`, que decide si `run-file` reintenta. Un falso positivo reintenta
+  tres veces un error de SQL que nunca va a cambiar; un falso negativo desperdicia los
+  reintentos. Se fija con siete errores de red y tres de SQL.
+- `execute_with_retries`, incluido que **no** reintente un error de sintaxis y que agote
+  los intentos antes de relanzar.
+
+### F4. El codigo de salida 2 significaba dos cosas distintas - OK
+
+**Reproducido** el 2026-08-27 contra el entry point instalado: `redshift-extractor ls
+--alais prod` (typo en el flag) salia con **2**, el mismo codigo que un `.env` roto. Igual
+`subcomando-inexistente` y `run-file` sin su argumento.
+
+**Como quedo.** Copiado de `mongo_extractor`, que lo encontro y lo arreglo primero:
+
+| Codigo | Significado |
+|---|---|
+| 0 | ok |
+| 1 | negocio |
+| 2 | configuracion |
+| 3 | tunel |
+| 64 | error de uso de la linea de comandos (`EX_USAGE` de `sysexits.h`) |
+| 130 | interrumpido con Ctrl+C |
+
+`cli.main()` es el entry point nuevo y `[project.scripts]` apunta a `cli:main` en vez de
+`cli:app`. La separacion vive ahi, sin tocar estado global de click.
+
+**Sobre el hallazgo 2 del pendiente** -que el texto del ESTANDAR dice `negocio=4` y nadie
+lo implementa asi-: esta libreria ya usaba `negocio=1`, que es lo que hacen las cuatro. No
+habia nada que cambiar aqui. **Lo que sigue pendiente es corregir el texto de F4 en
+`ESTANDAR.md`**, que es del ecosistema y no de este repo.
+
+**La trampa que advertia el pendiente, verificada.** Con `standalone_mode=False` click
+**devuelve** el codigo de un `typer.Exit` como valor de retorno y solo **levanta** las
+excepciones de uso. Tratarlas igual hace que todo salga con 0. `main()` usa el valor de
+retorno, y hay un test que fija que un `.env` roto sigue saliendo con 2 justamente para
+atrapar esa regresion.
+
+**Un detalle mas que el pendiente no traia**, y que `mongo_extractor` si resolvio: typer
+0.27 dejo de depender del paquete `click` y trae una copia vendorizada en `typer._click`,
+cuyas excepciones son clases distintas. Un `except click.UsageError` no matchea ahi y el
+error escaparia como traceback. `pyproject.toml` declara `typer>=0.12`, asi que las dos
+formas estan permitidas: `modulo_de_excepciones()` resuelve la correcta en tiempo de
+ejecucion desde la clase base del comando, y si no lo logra `main()` se cae al modo
+estandar de typer en vez de tronar. Este venv corre typer 0.25.1, que usa `click`.
+
+**Cubierto por** los tests de codigos de salida en `tests/test_cli.py`, que corren
+`main()` y no `app` con `CliRunner`: la separacion vive en `main()`, asi que con
+`CliRunner` sobre `app` estos tests pasarian sin probar nada. Hay ademas uno que lee
+`pyproject.toml` y falla si el entry point vuelve a apuntar a `:app`, porque el resto
+seguiria en verde.
+
+### C. `params` enlazados en `extract_sql` - OK
+
+**Reproducido** el 2026-08-27 por introspeccion: `params` no estaba en la firma. Se
+cerro sin esperar la senal -"la primera consulta cuyo filtro venga de fuera del
+codigo"-, porque el costo era bajo y la senal es justo el momento en que ya es tarde.
+
+**Como quedo.** `params: Optional[Dict[str, Any]] = None`, keyword-only. Los enlaza
+psycopg2 con su marcador nativo `%(nombre)s`:
+
+```python
+extract_sql(
+    "select * from ventas where ruta_id = %(ruta)s and fecha >= %(desde)s",
+    params={"ruta": ruta_id, "desde": "2026-01-01"},
+    alias="prod",
+)
+```
+
+Funciona igual con `query_file`, asi que un `.sql` versionado puede llevar sus
+marcadores y recibir los valores desde el codigo.
+
+**Divergencia deliberada de la referencia**, que enlaza con `:nombre` porque usa
+SQLAlchemy. Aqui es `%(nombre)s` y **no se traduce** de uno al otro: en Redshift `::` es
+el operador de cast y sale en casi cualquier query real, asi que un traductor de
+`:nombre` tendria que distinguirlo del cast y de los `:` dentro de cadenas literales.
+Fragil, y sin nada que ganar sobre el marcador que psycopg2 ya entiende.
+
+**La parte delicada, que el pendiente anotaba:** que `params=None` no cambie nada. Se
+resolvio no pasandole el argumento a `pd.read_sql` en ese caso, en vez de pasarle `None`.
+No es cosmetico: psycopg2 solo interpreta `%` cuando recibe parametros, asi que un
+`params=None` explicito le cambiaria el significado a un SQL con `%` literales -un
+`like '%rabbit%'`, un `to_char(x, '%Y')`- que hoy funciona.
+
+**Cubierto por** `tests/test_params.py`, 9 tests: que el marcador llega intacto y el
+valor viaja aparte, que un valor malicioso (`1; drop table ventas--`) no se convierte en
+SQL, que funciona con `query_file`, que sin `params` el argumento ni se pasa, y tres
+casos de `%` literales que tienen que seguir intactos.
+
+### D. La guarda de plataforma de `secret_loader.py` - OK
+
+**Reproducido** el 2026-08-27: `mypy src --platform linux` daba los cuatro errores
+`attr-defined` sobre `winreg.HKEY_CURRENT_USER`, `HKEY_LOCAL_MACHINE`, `OpenKey` y
+`QueryValueEx`.
+
+**Como quedo.** La guarda es `sys.platform != "win32"` en vez de `os.name != "nt"`, que
+mypy si entiende como estrechamiento de plataforma y que en runtime hace exactamente lo
+mismo. El cambio esta en las cuatro copias del ecosistema
+-`postgresql_extractor_uploader`, `mongo_extractor`, `netsuite_extractor` y esta-, que es
+como tenia que ir para no desalinearlas: `tests/test_divergencia.py` compara el archivo
+completo y pasa.
+
+**Y se retiro el workaround.** `[tool.mypy]` tenia `platform = "win32"` declarado solo
+para tapar esos cuatro errores. Ya no hace falta, y quitarlo tiene valor propio: con el
+workaround puesto, el typecheck **daba por bueno** todo el codigo especifico de Windows
+en vez de revisarlo. Verificado en las dos plataformas y sin declarar ninguna:
+
+```text
+mypy src --platform linux  -> Success: no issues found in 11 source files
+mypy src --platform win32  -> Success: no issues found in 11 source files
+mypy src                   -> Success: no issues found in 11 source files
+```
+
+**La sospecha del pendiente era correcta:** las hermanas tenian el mismo `os.name`, y
+ninguna declara `platform` en su `[tool.mypy]`, asi que sus CI estaban fallando por lo
+mismo. Con el cambio en las cuatro, eso queda cerrado tambien alla.
+
+**`redshift_uploader` no aplica:** no tiene `secret_loader.py` y tampoco esta en la lista
+de hermanas de `test_divergencia.py`.
 
 ## Cerrado en esta ronda
 
@@ -308,6 +578,21 @@ alias; el caso solo aparece al adoptar la forma nueva.
 La verificacion de la host key es la unica ruptura que **no tiene forma vieja posible**:
 aceptar cualquier host key *es* la vulnerabilidad que I1 cierra.
 
+### Lo que rompe de la ronda posterior a 0.3.0
+
+Nada de esto afecta a quien solo llame `extract_sql` o use el CLI a mano. Toca a dos
+tipos de consumidor:
+
+| Cambio | A quien le pega | Como encontrarlo |
+|---|---|---|
+| El aviso de guardado pasa de `QUERY_START` a `SAVE_CONFIGURED` | Quien filtre o cuente eventos | `findstr /s /n /c:"QUERY_START" *.py` |
+| `TUNNEL_START` se emite una vez, no dos | Quien cuente eventos o mida latencia del tunel | `findstr /s /n /c:"TUNNEL_START" *.py` |
+| Los errores de uso del CLI salen con **64** y ya no con 2 | Scripts, tareas programadas y CI que revisen el codigo de salida | grep de `errorlevel` en `.bat`, `$LASTEXITCODE` en `.ps1` |
+
+El cambio de codigos de salida es el unico con riesgo real de pasar inadvertido: un
+script que trataba el 2 como "error de configuracion" ahora ve un 64 ante un typo en el
+comando y no lo reconoce. A cambio, el 2 por fin significa una sola cosa.
+
 ---
 
 ## Lo que queda
@@ -420,74 +705,13 @@ justamente lo que la opcion 2 haria por dentro pero decidido por quien conoce el
 volumen. El ejemplo completo, incluido el que guarda cada trozo sin acumularlo, esta en
 la seccion "Extracciones grandes" del README.
 
-Las fechas van interpoladas porque `extract_sql` no acepta parametros enlazados. Aqui es
-inofensivo -las genera `pd.date_range`, no vienen de entrada de usuario- pero es la
-limitacion que anota la seccion C.
+Las fechas van interpoladas porque las genera `pd.date_range` en el propio codigo, no
+una entrada de usuario, asi que ahi es inofensivo. Si el rango viniera de fuera, va con
+`params` (cerrado; ver la seccion C en los cerrados).
 
 **Senal para reabrirlo:** una extraccion que no quepa en RAM **ni partida por fechas**,
 o una que tarde tanto que convenga `UNLOAD`. Cuando pase, empezar por la opcion 2 y
 saltarse la 1, que no resuelve nada.
-
-### C. `params` enlazados en `extract_sql`
-
-**Estado: FALTA. Fuera del estandar, encontrado el 2026-08-27.**
-
-`extract_sql` solo acepta el SQL como texto. La referencia acepta
-`params: Optional[Dict[str, Any]]` y los enlaza con bindparams (`:nombre`), con el
-comentario explicito de "nunca por interpolacion de texto".
-
-Aqui, cualquier consulta con valores variables se arma con `format` o f-strings. Con
-fechas generadas en el codigo es inofensivo, y es lo que hace el patron de la seccion B.
-Deja de serlo el dia que un valor venga de entrada de usuario -un filtro de un dashboard,
-un argumento de linea de comandos- porque entonces es inyeccion de SQL.
-
-**Costo:** bajo. `psycopg2` ya enlaza con `%(nombre)s` y `cursor.execute(sql, params)`;
-son ~10 lineas en `extract_sql` mas el paso de `params` a `pd.read_sql`. Lo que hay que
-cuidar es no cambiar el comportamiento de quien ya tiene `%` literales en su SQL: con
-`params=None` no debe tocarse nada.
-
-**Senal:** la primera consulta cuyo filtro venga de fuera del codigo. Hoy todas las
-llamadas conocidas son SQL fijo o fechas generadas.
-
-### D. La guarda de plataforma de `secret_loader.py` (ecosistema)
-
-**Estado: PARCIAL. Destrabado por configuracion aqui; el arreglo de fondo es del
-ecosistema.**
-
-`read_windows_env_value_from_registry` hace:
-
-```text
-if os.name != "nt":
-    return None
-import winreg
-... winreg.HKEY_CURRENT_USER ...
-```
-
-En tiempo de ejecucion es correcto. Para mypy no: estrecha la plataforma por
-`sys.platform`, no por `os.name`, asi que al typechequear para Linux los accesos a
-`winreg` son cuatro errores `attr-defined`. Es lo que tenia el CI de este repo en rojo
-desde su primera corrida.
-
-**Arreglo de fondo, dos lineas:** cambiar la guarda a `sys.platform != "win32"`. Es
-equivalente en CPython sobre Windows (`os.name == "nt"` si y solo si
-`sys.platform == "win32"`) y mypy si lo entiende.
-
-**Por que no se hizo aqui:** `secret_loader.py` es copia identica en las cuatro
-librerias del ecosistema (D5) y `tests/test_divergencia.py` lo comprueba. Cambiarlo solo
-en este repo lo desalinea de las tres hermanas y pone rojo ese test, que es exactamente
-lo que se acaba de construir para evitar. El cambio va en las cuatro a la vez o no va.
-
-**Mientras tanto:** `platform = "win32"` en `[tool.mypy]`, con el porque escrito en el
-`pyproject.toml`. No esconde nada relevante: la libreria corre en Windows y todo lo que
-importa en Linux -tunel, config, eventos- se typechequea igual, porque sus APIs existen
-en las dos plataformas.
-
-**Se sospecha que las hermanas tienen el mismo problema.** La referencia comparte el
-archivo y tambien corre mypy sobre Linux sin declarar plataforma, asi que su CI deberia
-estar fallando por lo mismo. Vale revisarlo antes de tocar las cuatro copias.
-
-**Senal:** ninguna, es barato. Conviene hacerlo en la proxima pasada que toque a las
-cuatro librerias, junto con el resto de lo que comparten.
 
 ---
 
@@ -498,100 +722,37 @@ cuatro librerias, junto con el resto de lo que comparten.
 | A. Empaquetado | OK |
 | B. Dependencias | OK. La resolucion conjunta queda documentada, no corrida (A de arriba) |
 | C. Configuracion y aislamiento | OK |
-| D. Credenciales | OK. `secret_loader` unico (shim retirado) y divergencia cubierta por test |
-| E. API publica | OK |
-| F. Errores | OK. `negocio=1` en el CLI en vez de `4`, igual que la referencia y que el comportamiento historico de esta libreria |
-| G. Eventos y logging | OK |
+| D. Credenciales | OK. `secret_loader` unico (shim retirado), divergencia cubierta por test y la guarda de plataforma alineada en las cuatro librerias (D de arriba) |
+| E. API publica | OK. `extract_sql` acepta `params` enlazados, que era lo unico que le faltaba contra la referencia (C de arriba) |
+| F. Errores | OK. `negocio=1` en el CLI en vez de `4`, igual que la referencia y que el comportamiento historico de esta libreria. Los errores de **uso** se separaron del 2 y salen con 64 (F4 de arriba); lo que queda es corregir el texto del ESTANDAR, no el codigo |
+| G. Eventos y logging | OK en catalogo, campos, aislamiento del logging y **secuencia**: los dos eventos duplicados se cerraron (F de arriba) y hay tests que los fijan |
 | H. Convivencia | OK |
 | I. Tunel | OK en el alcance de DE-4. I3 e I7 descartados con razon, con un test que impide que reaparezcan por accidente |
 | J. Escritura | n/a, esta libreria no escribe |
-| K. Calidad y documentacion | OK. El CI quedo verde en 3.10 y 3.13 el 2026-08-27, por primera vez en el repo: estaba rojo desde su primera corrida y este documento lo daba por bueno |
+| K. Calidad y documentacion | OK. El CI quedo verde en 3.10 y 3.13 el 2026-08-27, por primera vez en el repo: estaba rojo desde su primera corrida y este documento lo daba por bueno. La suite ya cubre tambien el CLI, que era el hueco de K1/K2 (G de arriba), y mypy volvio a typechequear el codigo de Windows al retirarse el `platform = "win32"` (D de arriba) |
 
 ---
 
-## F4: el codigo de salida 2 significa dos cosas distintas
+## F4 en el ESTANDAR: el texto sigue diciendo `negocio=4`
 
-**Agregado el 2026-08-27 desde `mongo_extractor`, que lo encontro y lo arreglo de su
-lado. Aplica igual aqui.**
+**Lo de este repo ya esta cerrado** (ver "F4" en los cerrados de arriba): el 64 se separo
+del 2 y esta libreria ya usaba `negocio=1`. Lo que queda es una correccion **al ESTANDAR**,
+no a las librerias.
 
-### Hallazgo 1: `typer`/`click` ya usa el 2, y choca con `EXIT_CONFIG`
-
-Verificado empiricamente: click sale con **2** ante un flag invalido, un argumento
-obligatorio faltante o un subcomando inexistente. Ese es el mismo codigo que el
-ecosistema asigno a los errores de configuracion, asi que:
-
-```
-<cli> ls --alais tx        -> exit 2   (typo en el flag)
-<cli> ls                   -> exit 2   (.env roto)
-```
-
-Un script de CI o un runner que trate el 2 como "problema de configuracion" se equivoca
-ante cualquier typo en la linea de comandos. F4 promete codigos **estables**, y un codigo
-que significa dos cosas no lo es.
-
-### Hallazgo 2: el texto del criterio dice `negocio=4`; nadie lo implementa asi
-
-Censo del 2026-08-27:
+El texto del criterio F4 dice `negocio=4`. Censo del 2026-08-27:
 
 | Libreria | negocio | config | tunel |
 |---|---|---|---|
 | `postgres_local_client` | 1 | 2 | 3 |
 | `redshift_extractor` | 1 | 2 | 3 |
-| `netsuite_extractor` | 1 | 2 | n/a |
+| `netsuite_extractor` | 1 | n/a | n/a |
 | `mongo_extractor` | 1 (era 4) | 2 | 3 |
 
-`mongo_extractor` se alineo a **1**, que es lo que hacen las otras tres y lo que dice la
-convencion de Unix. La razon de fondo: con `negocio=4`, el codigo **1 queda
-inalcanzable**, porque el `_guarded` de todos los CLI atrapa `Exception`; no existe
-ningun camino que produzca un 1, y un codigo que nunca ocurre no distingue nada.
+Ninguna implementa el 4, y `mongo_extractor` se alineo a 1 despues de haberlo intentado.
+La razon de fondo: con `negocio=4`, el codigo **1 queda inalcanzable**, porque el guard de
+todos los CLI atrapa `Exception`; no existe ningun camino que produzca un 1, y un codigo
+que nunca ocurre no distingue nada. El 1 es ademas la convencion de Unix.
 
-**Lo que hay que corregir es el texto del ESTANDAR (F4), no las cuatro librerias.**
+**Lo que hay que corregir es el texto del ESTANDAR, no las cuatro librerias.**
 
-### El arreglo, ya implementado en `mongo_extractor`
-
-Los errores de USO salen con **64** (`EX_USAGE` de `sysexits.h`), separados de los de
-config. Se hace en el entry point, sin tocar estado global de click:
-
-```python
-def main() -> None:
-    try:
-        codigo = app(standalone_mode=False)
-    except click.UsageError as exc:
-        exc.show()
-        raise SystemExit(EXIT_USAGE)
-    except click.ClickException as exc:
-        exc.show()
-        raise SystemExit(exc.exit_code)
-    except click.exceptions.Abort:
-        raise SystemExit(EXIT_INTERRUPTED)   # 130
-
-    raise SystemExit(codigo if isinstance(codigo, int) else EXIT_OK)
-```
-
-Y el entry point de `[project.scripts]` pasa de `<paquete>.cli:app` a
-`<paquete>.cli:main`.
-
-**La trampa que cuesta media hora si no se sabe:** con `standalone_mode=False`, click
-**devuelve** el codigo de un `typer.Exit` como valor de retorno y solo **levanta** las
-excepciones de usuario. Si se tratan igual -atrapando `click.exceptions.Exit` y
-esperando que se levante- **todos los errores salen con 0**. Hay que usar el valor de
-retorno.
-
-Cuadro final:
-
-| Codigo | Significado |
-|---|---|
-| 0 | ok |
-| 1 | negocio |
-| 2 | configuracion |
-| 3 | tunel |
-| 64 | error de uso de la linea de comandos |
-| 130 | interrumpido con Ctrl+C |
-
-**Que copiar:** `mongo_extractor/src/mongo_extractor/cli.py` (constantes y `main()`) y
-`mongo_extractor/tests/test_cli_exit_codes.py`, que prueba los diez casos corriendo el
-entry point real -con `CliRunner` sobre `app` no se ejercitaria, porque la separacion
-vive en `main()`.
-
-**Senal:** ninguna urgente si nadie automatiza sobre los codigos de salida. Es una
-edicion de ~15 lineas mas una linea en `pyproject.toml`.
+**Senal:** la proxima pasada que toque `ESTANDAR.md`. No hay codigo que escribir.

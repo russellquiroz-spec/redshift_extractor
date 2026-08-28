@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib
 import time
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Callable, Dict, Optional
 
 import pandas as pd
@@ -23,6 +25,13 @@ EXIT_OK = 0
 EXIT_BUSINESS = 1
 EXIT_CONFIG = 2
 EXIT_TUNNEL = 3
+#: Error de USO de la linea de comandos: flag mal escrito, argumento faltante,
+#: subcomando inexistente. `EX_USAGE` de `sysexits.h`. Sin este codigo, click sale con
+#: 2 por su cuenta -el mismo que `EXIT_CONFIG`-, asi que un typo en el comando es
+#: indistinguible de un `.env` roto para cualquier script que lea el codigo de salida.
+EXIT_USAGE = 64
+#: Interrumpido con Ctrl+C. 128 + SIGINT, la convencion de shell.
+EXIT_INTERRUPTED = 130
 
 CONNECTION_ERROR_HINTS = (
     "could not establish connection",
@@ -100,6 +109,34 @@ def strip_trailing_semicolons(sql: str) -> str:
     return cleaned
 
 
+def first_keyword(sql: str) -> str:
+    """
+    Primera palabra de la sentencia, saltando comentarios de linea y de bloque.
+
+    Solo sirve para decidir si el SQL se puede envolver con LIMIT: el SQL que se
+    ejecuta es el original, con sus comentarios intactos. Se consume desde el inicio y
+    se para en el primer token real, asi que un `--` dentro de una cadena literal nunca
+    se confunde con un comentario —para cuando aparece, ya paramos—.
+
+    Devuelve "" si el archivo no trae mas que comentarios y espacios.
+    """
+    i, n = 0, len(sql)
+    while i < n:
+        if sql[i].isspace():
+            i += 1
+        elif sql.startswith("--", i):
+            salto = sql.find("\n", i)
+            i = n if salto == -1 else salto + 1
+        elif sql.startswith("/*", i):
+            cierre = sql.find("*/", i + 2)
+            i = n if cierre == -1 else cierre + 2
+        else:
+            break
+
+    resto = sql[i:]
+    return resto.split(maxsplit=1)[0].lower() if resto.strip() else ""
+
+
 def apply_limit(sql: str, limit: Optional[int]) -> str:
     cleaned = strip_trailing_semicolons(sql)
     if not cleaned:
@@ -110,10 +147,13 @@ def apply_limit(sql: str, limit: Optional[int]) -> str:
     if limit <= 0:
         raise ValueError("--limit debe ser mayor a 0. Usa --full si no quieres limite.")
 
-    first_word = cleaned.lstrip().split(maxsplit=1)[0].lower()
-    if first_word not in {"select", "with"}:
+    palabra = first_keyword(cleaned)
+    if not palabra:
+        raise ValueError("El archivo SQL no trae ninguna sentencia: solo comentarios.")
+    if palabra not in {"select", "with"}:
         raise ValueError(
-            "El modo LIMIT solo funciona con SELECT/WITH. Usa --full para ejecutar este SQL."
+            f"El modo LIMIT solo funciona con SELECT/WITH, y este SQL empieza con "
+            f"'{palabra}'. Usa --full para ejecutar este SQL."
         )
 
     return f"SELECT *\nFROM (\n{cleaned}\n) AS query_limitada\nLIMIT {limit}"
@@ -300,3 +340,70 @@ def run_file(
             typer.echo(f"\nCSV guardado en: {output}")
 
     guarded(action)
+
+
+def modulo_de_excepciones() -> Optional[ModuleType]:
+    """
+    Localiza el modulo de excepciones del click que typer este usando de verdad.
+
+    typer 0.27 dejo de depender del paquete `click` y trae una copia vendorizada en
+    `typer._click`. Sus excepciones son clases **distintas** de las de `click`, asi que
+    un `except click.UsageError` no matchea con typer>=0.27 y el error de uso escapa
+    como traceback en vez de salir con su codigo. `pyproject.toml` declara
+    `typer>=0.12`, asi que las dos formas estan permitidas y hay que resolverlo en
+    tiempo de ejecucion.
+
+    Se resuelve desde la clase base del comando que arma typer, que es lo unico que
+    apunta a la copia correcta en las dos. Si no se logra, se devuelve None y `main()`
+    se cae al modo estandar de typer.
+    """
+    try:
+        comando = typer.main.get_command(app)
+    except Exception:  # noqa: BLE001 - si la API interna cambia, se sigue sin separar
+        return None
+
+    for base in type(comando).__mro__:
+        modulo = base.__module__
+        if not modulo.endswith(".core"):
+            continue
+        raiz = modulo[: -len(".core")]
+        try:
+            candidato = importlib.import_module(f"{raiz}.exceptions")
+        except ImportError:
+            continue
+        if hasattr(candidato, "UsageError") and hasattr(candidato, "ClickException"):
+            return candidato
+    return None
+
+
+def main() -> None:
+    """
+    Entry point de la consola. Separa los errores de USO de los de configuracion.
+
+    Sin esto, click atrapa el `UsageError` por su cuenta y sale con 2 -el mismo codigo
+    que `EXIT_CONFIG`-, asi que `redshift-extractor ls --alais prod` es indistinguible
+    de un `.env` roto para cualquier script que lea el codigo de salida.
+
+    `standalone_mode=False` es lo que hace que click levante sus excepciones en vez de
+    manejarlas y salir el mismo. Ojo con la asimetria: en ese modo click **devuelve** el
+    codigo de un `typer.Exit` como valor de retorno y solo **levanta** las excepciones
+    de usuario. Tratar las dos igual hace que todo salga con 0.
+    """
+    excepciones: Any = modulo_de_excepciones()
+    if excepciones is None:
+        # Sin poder distinguirlas, mejor el comportamiento de siempre que un traceback.
+        app()
+        return
+
+    try:
+        codigo = app(standalone_mode=False)
+    except excepciones.UsageError as exc:
+        exc.show()
+        raise SystemExit(EXIT_USAGE)
+    except excepciones.ClickException as exc:
+        exc.show()
+        raise SystemExit(exc.exit_code)
+    except excepciones.Abort:
+        raise SystemExit(EXIT_INTERRUPTED)
+
+    raise SystemExit(codigo if isinstance(codigo, int) else EXIT_OK)
