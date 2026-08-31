@@ -30,11 +30,12 @@ duplicados en el stream (F), `cli.py` sin pruebas (G) y un warning de pandas que
 filtra a consola (H)-, **todas cerradas ya**; estan en "Cerrado despues de la validacion
 funcional", con la evidencia de haber reproducido cada una antes de tocarla.
 
-**Lo que sigue abierto no es trabajo, son dos decisiones ya tomadas:** A -documentar que
-garantiza la politica de dependencias en vez de guardar una evidencia que caduca- y B
--no agregar `chunksize`/streaming/`UNLOAD`, resolverlo en el llamador partiendo por
-fechas-. Las dos tienen escrita su senal de cuando conviene reabrirlas. C y D, que si
-eran trabajo, quedaron cerradas.
+**Lo que sigue abierto.** Nada de codigo. Dos decisiones **ya tomadas** -A, documentar
+en vez de correr la resolucion conjunta; B, no agregar `chunksize`/streaming/`UNLOAD` y
+resolverlo en el llamador partiendo por fechas-, las dos con su senal escrita de cuando
+reabrirlas. Y una decision **sin tomar**: C, como se libera una version, que salio al
+terminar 0.4.0 y querer etiquetarla. Los dos pendientes que si eran trabajo -los que en
+la ronda anterior se llamaban C y D- quedaron cerrados.
 
 **Alcance de la ruptura:** 0.2.0 nunca se publico. Esta libreria pasa de 0.1.0 a 0.3.0
 en un solo salto, asi que **los hosts no tienen ventana de deprecacion**: las formas
@@ -743,6 +744,47 @@ una entrada de usuario, asi que ahi es inofensivo. Si el rango viniera de fuera,
 **Senal para reabrirlo:** una extraccion que no quepa en RAM **ni partida por fechas**,
 o una que tarde tanto que convenga `UNLOAD`. Cuando pase, empezar por la opcion 2 y
 saltarse la 1, que no resuelve nada.
+
+### C. Como se libera una version: tags y distribucion
+
+**Estado: SIN DECIDIR. Anotado el 2026-08-31, al terminar 0.4.0.**
+
+No es codigo pendiente, es una decision que nunca se tomo y que hasta hoy no habia hecho
+falta. Se anota porque al querer "liberar" 0.4.0 salio que no hay con que hacerlo.
+
+**Que hay hoy.** Nada de release: `.github/workflows/` tiene un solo archivo, `ci.yml`,
+que corre los tests en 3.10 y 3.13. **El repo no tiene ni un solo tag** -ni de 0.1.0, ni
+de 0.3.0, ni de 0.4.0- y no hay workflow que publique nada.
+
+**Como se instala hoy**, segun el README: `pip install -e .` desde una copia del repo. Es
+decir, cada host clona y apunta a lo que tenga esa copia en ese momento.
+
+**Que problema trae.** Un host no puede pedir una version concreta. `pip install
+git+...@main` trae lo ultimo que se haya mergeado, incluidos los cambios que rompen: los
+de 0.4.0 -eventos y codigos de salida- entran sin aviso a quien vuelva a instalar. Sin
+tags no hay forma de decir "quedate en 0.3.0 hasta que edites tus scripts", que es
+justamente la ventana que la tabla de "Cambios que rompen" da por supuesta.
+
+**Las decisiones que hay que tomar, en orden:**
+
+| Decision | Opciones | Que implica |
+|---|---|---|
+| 1. Tags | Ninguno / solo de aqui en adelante / retroactivos para 0.3.0 y 0.4.0 | Un tag por version es lo minimo para que un host pinee. Los retroactivos son gratis: los commits ya existen |
+| 2. Donde vive el paquete | Solo el repo (`git+https://...@v0.4.0`) / wheels en GitHub Releases / un indice interno | Desde el repo funciona hoy y no cuesta nada. Un indice interno es infraestructura nueva |
+| 3. Quien corta la version | A mano / un workflow al hacer push de un tag | A mano es suficiente con esta frecuencia de releases |
+
+**Lo minimo que resuelve el problema real** es la opcion 1 mas la 2 en su forma barata:
+etiquetar cada version y que los hosts instalen con `@vX.Y.Z`. No hace falta workflow ni
+indice.
+
+**Ojo con la coherencia del tag.** `main` declara `version = "0.4.0"` en `pyproject.toml`
+y su `CHANGELOG.md` abre con `## 0.4.0`. El fin de la ronda 0.3.0 es el commit `e35c539`,
+que declara `version = "0.3.0"`. Un tag tiene que apuntar al commit cuya version
+coincide, o el tag miente: quien instale `@v0.3.0` recibiria un paquete que `pip show`
+reporta como 0.4.0 y que trae los cambios que rompen.
+
+**Senal:** el primer host que necesite quedarse en una version mientras edita sus
+scripts, o cualquier instalacion que no sea `-e .` desde una copia local.
 
 ---
 
