@@ -9,7 +9,7 @@ Ultima revision: 2026-08-27.
 pendiente de hacer. Primero se cerraron los once que tenia esta libreria, mas el retiro
 de las formas viejas, el test de divergencia y el shim de credenciales; despues los
 cuatro hallazgos de la validacion funcional (E, F, G, H), F4 -que llego desde
-`mongo_extractor`- y por ultimo C y D. La suite paso de 13 a **247 tests**: 243 corren
+`mongo_extractor`- y por ultimo C y D. La suite paso de 13 a **248 tests**: 244 corren
 sin infraestructura, 3 son de integracion contra el bastion real y 1 depende de si
 `pyarrow` esta instalado.
 
@@ -216,15 +216,46 @@ atrapar esa regresion.
 0.27 dejo de depender del paquete `click` y trae una copia vendorizada en `typer._click`,
 cuyas excepciones son clases distintas. Un `except click.UsageError` no matchea ahi y el
 error escaparia como traceback. `pyproject.toml` declara `typer>=0.12`, asi que las dos
-formas estan permitidas: `modulo_de_excepciones()` resuelve la correcta en tiempo de
-ejecucion desde la clase base del comando, y si no lo logra `main()` se cae al modo
-estandar de typer en vez de tronar. Este venv corre typer 0.25.1, que usa `click`.
+formas estan permitidas y hay que resolverlas en tiempo de ejecucion.
+
+**Y ahi se metio un bug que el CI atrapo, no la suite local.** La primera version de
+`clases_de_error()` localizaba el modulo `typer._click.exceptions` y sacaba las clases de
+ahi. Duro exactamente una version de parche: ese modulo privado se mueve.
+
+```text
+typer 0.25.1   typer.Abort -> click.exceptions.Abort
+typer 0.27.1   typer.Abort -> typer._click.exceptions.Abort
+typer 0.27.2   typer.Abort -> typer.exceptions.Abort   (ya no esta en _click)
+```
+
+El venv del proyecto trae typer **0.25.1**, donde el bug es invisible porque `Abort` si
+esta donde se la buscaba. El CI instala la ultima -0.27.2 el 2026-08-31- y trono con
+`AttributeError: module 'typer._click.exceptions' has no attribute 'Abort'`.
+
+**Como quedo.** Todo sale de la API **publica** de typer: `typer.Abort` y
+`typer.BadParameter`, cuyo MRO pasa por `UsageError` y `ClickException` vivan donde
+vivan. Es el mismo enfoque que ya tenia `mongo_extractor`, que llego primero a este
+problema. Si algo de esto cambiara, `clases_de_error()` devuelve None y `main()` se cae
+al modo estandar de typer -peor, porque el error de uso vuelve a salir con 2- pero nunca
+un traceback.
+
+**Leccion, y es la parte que vale:** una suite verde contra **una** version de una
+dependencia con rango `>=` no dice nada sobre las demas. La verificacion de este punto se
+rehizo contra typer 0.25.1 **y** 0.27.2, y el test de regresion simula el modulo sin
+`Abort`, asi que atrapa el problema con cualquier typer instalado y no solo con el que
+traiga el runner.
 
 **Cubierto por** los tests de codigos de salida en `tests/test_cli.py`, que corren
 `main()` y no `app` con `CliRunner`: la separacion vive en `main()`, asi que con
 `CliRunner` sobre `app` estos tests pasarian sin probar nada. Hay ademas uno que lee
 `pyproject.toml` y falla si el entry point vuelve a apuntar a `:app`, porque el resto
-seguiria en verde.
+seguiria en verde, y otro que falla si las clases de error vuelven a salir del modulo
+privado de typer.
+
+**Pendiente del ecosistema:** `netsuite_extractor` todavia busca `Abort` en el modulo
+privado, asi que su CI deberia estar fallando por lo mismo en cuanto instale typer
+0.27.2. `mongo_extractor` ya esta arreglado y `postgresql_extractor_uploader` no tiene
+`main()`.
 
 ### C. `params` enlazados en `extract_sql` - OK
 

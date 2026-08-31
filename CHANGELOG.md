@@ -53,6 +53,21 @@ mano no cambia nada.
   estado global de click, mas el 130 para Ctrl+C. Ya estaba resuelto asi en
   `mongo_extractor`.
 
+  **Las clases de error se resuelven desde la API publica de typer**, no desde el modulo
+  privado `typer._click.exceptions`. Hace falta resolverlas en runtime porque desde
+  typer 0.27 las excepciones del click vendorizado son clases DISTINTAS de las del
+  paquete `click`, asi que un `except click.UsageError` fijo no matchea. Pero ese modulo
+  privado se mueve entre versiones de parche:
+
+  ```text
+  typer 0.25.1   typer.Abort -> click.exceptions.Abort
+  typer 0.27.1   typer.Abort -> typer._click.exceptions.Abort
+  typer 0.27.2   typer.Abort -> typer.exceptions.Abort   (ya no esta en _click)
+  ```
+
+  Lo estable son `typer.Abort` y `typer.BadParameter`, cuyo MRO pasa por `UsageError` y
+  `ClickException` vivan donde vivan. Verificado contra typer 0.25.1 y 0.27.2.
+
 ### Agrega
 
 - **`params` en `extract_sql`**, para enlazar valores en vez de interpolarlos. Hasta
@@ -79,7 +94,7 @@ mano no cambia nada.
   parametros, asi que un SQL con `%` literales (`like '%rabbit%'`, `to_char(x, '%Y')`)
   sigue funcionando igual. Hay tests que lo fijan.
 
-- `tests/test_cli.py`: 65 tests de `cli.py`, que estaba en cero cobertura pese a ser la
+- `tests/test_cli.py`: 66 tests de `cli.py`, que estaba en cero cobertura pese a ser la
   superficie que se usa a mano y la que corre en tareas programadas. Cubre `apply_limit`,
   `first_keyword`, `read_sql`, `strip_trailing_semicolons`, `is_connection_error`,
   `execute_with_retries`, `print_result` y los codigos de salida del entry point real.

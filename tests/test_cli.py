@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import typer
 
 from redshift_extractor import cli as cli_mod
 from redshift_extractor.cli import (
@@ -381,18 +382,51 @@ def test_error_de_negocio_sale_con_1(monkeypatch, write_env, minimal_env, tmp_pa
 
 def test_ctrl_c_sale_con_130(monkeypatch, write_env, minimal_env):
     write_env(minimal_env)
-    excepciones = cli_mod.modulo_de_excepciones()
-    assert excepciones is not None
 
     def aborta(**_kwargs):
-        raise excepciones.Abort()
+        raise typer.Abort()
 
-    # El modulo se fija aparte: `modulo_de_excepciones()` lo resuelve **desde `app`**, y
-    # con `app` ya sustituido por esta funcion no podria, se caeria al modo estandar y el
-    # Abort escaparia sin traducirse.
-    monkeypatch.setattr(cli_mod, "modulo_de_excepciones", lambda: excepciones)
     monkeypatch.setattr(cli_mod, "app", aborta)
     assert _salida_de(monkeypatch, ["ls"]) == cli_mod.EXIT_INTERRUPTED
+
+
+def test_las_clases_de_error_salen_de_la_api_publica_de_typer():
+    """
+    Regresion del CI: la primera version de esto sacaba las tres clases del modulo
+    privado `typer._click.exceptions`, y duro una version de parche. typer 0.27.2 movio
+    `Abort` a `typer.exceptions` y el CI truen0 con AttributeError.
+
+    Lo estable es `typer.BadParameter` -cuyo MRO pasa por `UsageError` y
+    `ClickException` vivan donde vivan- mas `typer.Abort`. Nada de modulos privados.
+    """
+    clases = cli_mod.clases_de_error()
+    assert clases is not None
+
+    usage_error, click_exception, abort = clases
+    assert {c.__name__ for c in (usage_error, click_exception, abort)} == {
+        "UsageError",
+        "ClickException",
+        "Abort",
+    }
+    # Tienen que ser las del click que typer usa de verdad, no las de otro paquete.
+    assert issubclass(typer.BadParameter, usage_error)
+    assert issubclass(usage_error, click_exception)
+    assert abort is typer.Abort
+    # Y no deben venir del modulo privado que se mueve entre parches.
+    assert "_click.exceptions" not in abort.__module__
+
+
+def test_mostrar_error_no_revienta_si_la_excepcion_no_trae_show(capsys):
+    """
+    Las clases llegan resueltas en runtime, asi que su interfaz no esta garantizada.
+    Un AttributeError aqui reventaria dentro del propio manejador de errores.
+    """
+
+    class SinShow(Exception):
+        pass
+
+    cli_mod.mostrar_error(SinShow("algo trono"))
+    assert "algo trono" in capsys.readouterr().err
 
 
 def test_comando_exitoso_sale_con_0(monkeypatch, write_env, minimal_env):
@@ -415,21 +449,9 @@ def test_el_entry_point_apunta_a_main_y_no_a_app():
     assert "redshift_extractor.cli:app" not in contenido
 
 
-def test_modulo_de_excepciones_encuentra_el_click_que_usa_typer():
-    """
-    typer>=0.27 vendoriza click en `typer._click`, y sus excepciones son clases
-    distintas de las de `click`. `pyproject.toml` declara `typer>=0.12`, asi que las dos
-    formas estan permitidas y hay que resolverlo en tiempo de ejecucion.
-    """
-    modulo = cli_mod.modulo_de_excepciones()
-    assert modulo is not None
-    for nombre in ("UsageError", "ClickException", "Abort"):
-        assert hasattr(modulo, nombre), nombre
-
-
 def test_main_no_truena_si_no_puede_resolver_las_excepciones(monkeypatch):
     """Sin poder distinguirlas, se cae al modo estandar de typer en vez de un traceback."""
-    monkeypatch.setattr(cli_mod, "modulo_de_excepciones", lambda: None)
+    monkeypatch.setattr(cli_mod, "clases_de_error", lambda: None)
     llamadas = []
     monkeypatch.setattr(cli_mod, "app", lambda *a, **k: llamadas.append(k))
     monkeypatch.setattr(sys, "argv", ["redshift-extractor", "--help"])

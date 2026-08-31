@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import importlib
 import time
 from pathlib import Path
-from types import ModuleType
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple, Type
 
 import pandas as pd
 import typer
@@ -342,38 +340,53 @@ def run_file(
     guarded(action)
 
 
-def modulo_de_excepciones() -> Optional[ModuleType]:
+ClasesDeError = Tuple[Type[BaseException], Type[BaseException], Type[BaseException]]
+
+
+def clases_de_error() -> Optional[ClasesDeError]:
     """
-    Localiza el modulo de excepciones del click que typer este usando de verdad.
+    Devuelve (UsageError, ClickException, Abort) del click que typer este usando.
 
-    typer 0.27 dejo de depender del paquete `click` y trae una copia vendorizada en
-    `typer._click`. Sus excepciones son clases **distintas** de las de `click`, asi que
-    un `except click.UsageError` no matchea con typer>=0.27 y el error de uso escapa
-    como traceback en vez de salir con su codigo. `pyproject.toml` declara
-    `typer>=0.12`, asi que las dos formas estan permitidas y hay que resolverlo en
-    tiempo de ejecucion.
+    Todo sale de la API **publica** de typer, a proposito. La primera version de esto
+    localizaba el modulo `typer._click.exceptions` y sacaba las clases de ahi, y duro
+    exactamente una version de parche: ese modulo privado se mueve.
 
-    Se resuelve desde la clase base del comando que arma typer, que es lo unico que
-    apunta a la copia correcta en las dos. Si no se logra, se devuelve None y `main()`
-    se cae al modo estandar de typer.
+        typer 0.25.1   typer.Abort -> click.exceptions.Abort
+        typer 0.27.1   typer.Abort -> typer._click.exceptions.Abort
+        typer 0.27.2   typer.Abort -> typer.exceptions.Abort   (ya no esta en _click)
+
+    Lo estable son `typer.Abort` y `typer.BadParameter`, que existen en las tres, y el
+    MRO de `BadParameter` siempre pasa por `UsageError` y `ClickException` vivan donde
+    vivan. Hace falta resolverlas asi, y no con un `except click.UsageError` fijo,
+    porque desde typer 0.27 las excepciones del click vendorizado son clases DISTINTAS
+    de las del paquete `click`: el `except` no matchea y el error de uso escapa como
+    traceback en vez de salir con su codigo.
+
+    Si algo de esto cambia, se devuelve None y `main()` se cae al modo estandar de
+    typer, que es peor -el error de uso vuelve a salir con 2- pero nunca un traceback.
+
+    Identico al de `mongo_extractor`, que llego primero a este problema.
     """
     try:
-        comando = typer.main.get_command(app)
-    except Exception:  # noqa: BLE001 - si la API interna cambia, se sigue sin separar
+        por_nombre = {clase.__name__: clase for clase in typer.BadParameter.__mro__}
+        return por_nombre["UsageError"], por_nombre["ClickException"], typer.Abort
+    except (AttributeError, KeyError):  # pragma: no cover - solo si typer se reescribe
         return None
 
-    for base in type(comando).__mro__:
-        modulo = base.__module__
-        if not modulo.endswith(".core"):
-            continue
-        raiz = modulo[: -len(".core")]
-        try:
-            candidato = importlib.import_module(f"{raiz}.exceptions")
-        except ImportError:
-            continue
-        if hasattr(candidato, "UsageError") and hasattr(candidato, "ClickException"):
-            return candidato
-    return None
+
+def mostrar_error(exc: BaseException) -> None:
+    """
+    Imprime el error como lo haria click.
+
+    Las clases llegan resueltas en runtime, asi que su interfaz no esta garantizada: si
+    `show()` no estuviera, se imprime a stderr en vez de reventar con AttributeError
+    dentro del propio manejador de errores.
+    """
+    mostrar = getattr(exc, "show", None)
+    if callable(mostrar):
+        mostrar()
+    else:  # pragma: no cover - solo si click deja de tener show()
+        typer.echo(str(exc), err=True)
 
 
 def main() -> None:
@@ -389,21 +402,23 @@ def main() -> None:
     codigo de un `typer.Exit` como valor de retorno y solo **levanta** las excepciones
     de usuario. Tratar las dos igual hace que todo salga con 0.
     """
-    excepciones: Any = modulo_de_excepciones()
-    if excepciones is None:
+    clases = clases_de_error()
+    if clases is None:
         # Sin poder distinguirlas, mejor el comportamiento de siempre que un traceback.
         app()
         return
 
+    usage_error, click_exception, abort = clases
+
     try:
         codigo = app(standalone_mode=False)
-    except excepciones.UsageError as exc:
-        exc.show()
+    except usage_error as exc:
+        mostrar_error(exc)
         raise SystemExit(EXIT_USAGE)
-    except excepciones.ClickException as exc:
-        exc.show()
-        raise SystemExit(exc.exit_code)
-    except excepciones.Abort:
+    except click_exception as exc:
+        mostrar_error(exc)
+        raise SystemExit(getattr(exc, "exit_code", EXIT_BUSINESS))
+    except abort:
         raise SystemExit(EXIT_INTERRUPTED)
 
     raise SystemExit(codigo if isinstance(codigo, int) else EXIT_OK)
