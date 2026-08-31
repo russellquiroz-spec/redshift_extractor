@@ -4,6 +4,7 @@ import ast
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Mapping
 
@@ -12,7 +13,12 @@ _PASSWORD_KEYS = ("password", "pass", "pwd")
 
 
 def read_windows_env_value_from_registry(env_name: str) -> str | None:
-    if os.name != "nt":
+    # El guard va sobre `sys.platform` y no sobre `os.name` porque mypy entiende el
+    # primero como estrechamiento de plataforma y el segundo no: con `os.name`, al
+    # correr mypy en Linux -como hace el CI- da cuatro errores `attr-defined` sobre
+    # los atributos de winreg, que en typeshed solo existen para win32. En runtime
+    # los dos guards hacen exactamente lo mismo.
+    if sys.platform != "win32":
         return None
 
     try:

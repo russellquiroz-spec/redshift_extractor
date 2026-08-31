@@ -4,43 +4,56 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "redshift-extractor"
-version = "0.1.0"
+version = "0.4.0"
 description = "Internal library to extract data from Amazon Redshift via SSH tunnel"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Rabbit", email = "data@company.local" }]
 license = { text = "Proprietary" }
 
+# Politica de dependencias (ver docs/compatibilidad.md):
+# rangos con `>=` y SIN techo. Un techo preventivo en una libreria interna se
+# vuelve un conflicto irresoluble cuando un proyecto host la instala junto a otra
+# del ecosistema. Los pisos son el minimo real probado, no el mas alto disponible:
+# un piso alto excluye tanto como un techo bajo.
 dependencies = [
-  "pandas>=2.2.3",
-  "psycopg2-binary>=2.9.9",
-  "sshtunnel==0.4.0",
-  # NO subir el techo de paramiko sin cambiar sshtunnel: sshtunnel 0.4.0 (su ultima
-  # release, 2021) referencia `paramiko.DSSKey` dentro de get_keys(), que se llama en
-  # cada construccion del forwarder. paramiko elimino DSSKey en 4.0.0, asi que con
-  # paramiko>=4 el tunel truena con:
+  "pandas>=2.0",
+  "psycopg2-binary>=2.9",
+  "sshtunnel>=0.4",
+  # UNICO techo del proyecto, con incompatibilidad concreta y verificada:
+  # sshtunnel 0.4.0 (su ultima release, 2021) referencia `paramiko.DSSKey` dentro de
+  # get_keys(), que se llama en cada construccion del forwarder. paramiko elimino
+  # DSSKey en 4.0.0, asi que con paramiko>=4 el tunel truena con:
   #   AttributeError: module 'paramiko' has no attribute 'DSSKey'
   # Verificado 2026-08-12 con paramiko 4.0.0 y 5.0.0. Ultima compatible: 3.5.1.
-  "paramiko>=3.5.0,<4",
-  "keyring>=25.6.0",
-  "python-dotenv==1.0.1",
-  "typer>=0.12.0",
-  "pyarrow>=17.0.0",
+  # Se quita cuando salga una sshtunnel que soporte paramiko>=4.
+  "paramiko>=2.7.2,<4",
+  "keyring>=24",
+  "python-dotenv>=1.0",
+  "typer>=0.12",
 ]
 
 [project.optional-dependencies]
+# pyarrow son ~40 MB que solo hacen falta para save_parquet=True. Fuera de las
+# dependencias duras para no cobrarselos a todo host que solo quiera leer SQL (A8).
+parquet = ["pyarrow>=12"]
 dev = [
-  "pytest==8.3.2",
-  "ruff==0.6.9",
-  "mypy==1.11.2",
+  "pytest>=8",
+  "ruff>=0.6",
+  "mypy>=1.11",
 ]
 
 # CLI opcional (si vas a usar cli.py)
 [project.scripts]
-redshift-extractor = "redshift_extractor.cli:app"
+#: `:main` y no `:app`: la separacion del codigo de uso (64) del de config (2) vive en
+#: `main()`. Apuntar a `app` la saltaria y los dos volverian a salir con 2.
+redshift-extractor = "redshift_extractor.cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
+
+[tool.setuptools.package-data]
+redshift_extractor = ["py.typed"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -50,10 +63,38 @@ include = ["redshift_extractor*"]
 line-length = 100
 target-version = "py310"
 
+[tool.ruff.lint]
+# Explicito porque el conjunto por default de ruff cambia entre versiones y el rango
+# declarado es `ruff>=0.6`. Mismo conjunto efectivo que las hermanas del ecosistema.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.mypy]
 python_version = "3.10"
+files = ["src/redshift_extractor"]
+# Sin `platform` declarado a proposito: mypy typechequea para la plataforma en la que
+# corre, y pasa en las dos. Aqui hubo un `platform = "win32"` que existia solo para
+# tapar cuatro errores `attr-defined` sobre `winreg` al correr en Linux —el CI—, porque
+# `secret_loader` guardaba el import con `os.name != "nt"` y mypy estrecha por
+# `sys.platform`, no por `os.name`. Esa fue la razon de que el CI estuviera en rojo
+# desde su primera corrida.
+#
+# El arreglo de fondo ya esta en las cuatro librerias del ecosistema: la guarda es
+# `sys.platform != "win32"`, que mypy si entiende y que en runtime hace exactamente lo
+# mismo. Sin el workaround, el typecheck vuelve a cubrir el codigo especifico de
+# Windows en vez de darlo por bueno.
 ignore_missing_imports = true
 disallow_untyped_defs = true
 no_implicit_optional = true
 check_untyped_defs = true
 strict_optional = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# basetemp propio del proyecto: el default (%TEMP%\pytest-of-<usuario>) deja un
+# symlink `pytest-current` que en esta maquina no se puede resolver ni borrar, y la
+# limpieza de fin de sesion truena con PermissionError aunque todos los tests pasen.
+addopts = "--basetemp=.pytest_tmp"
+markers = [
+  "integration: requiere el bastion y el cluster Redshift real (se salta si no hay)",
+  "sshserver: requiere el servidor SSH de prueba en proceso (paramiko)",
+]

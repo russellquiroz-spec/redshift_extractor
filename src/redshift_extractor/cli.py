@@ -2,18 +2,34 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Dict, Optional, Tuple, Type
 
 import pandas as pd
 import typer
 
-from redshift_extractor.extractor import extract_sql, list_databases
+from redshift_extractor.errors import ConfigError, TunnelError
+from redshift_extractor.extractor import extract_sql, list_aliases, ping
 from redshift_extractor.io import save_dataframe
 from redshift_extractor.logging import configure_logging
 
 app = typer.Typer(add_completion=False)
 
 DEFAULT_LIMIT = 10
+
+#: Codigos de salida del contrato de la CLI (F4). `negocio=1` se conserva porque es
+#: lo que esta libreria ha devuelto siempre y hay scripts que lo revisan; config y
+#: tunel se separan para poder distinguirlos sin leer el texto del error.
+EXIT_OK = 0
+EXIT_BUSINESS = 1
+EXIT_CONFIG = 2
+EXIT_TUNNEL = 3
+#: Error de USO de la linea de comandos: flag mal escrito, argumento faltante,
+#: subcomando inexistente. `EX_USAGE` de `sysexits.h`. Sin este codigo, click sale con
+#: 2 por su cuenta -el mismo que `EXIT_CONFIG`-, asi que un typo en el comando es
+#: indistinguible de un `.env` roto para cualquier script que lea el codigo de salida.
+EXIT_USAGE = 64
+#: Interrumpido con Ctrl+C. 128 + SIGINT, la convencion de shell.
+EXIT_INTERRUPTED = 130
 
 CONNECTION_ERROR_HINTS = (
     "could not establish connection",
@@ -27,6 +43,53 @@ CONNECTION_ERROR_HINTS = (
     "timed out",
     "operationalerror",
 )
+
+ALIAS_OPTION = typer.Option(None, "--alias", help="Alias de cluster (default: DEFAULT_ALIAS).")
+
+
+def console_level(debug: bool = False) -> str:
+    """
+    Nivel del logger de consola del CLI.
+
+    WARNING a proposito: los eventos INFO ya le llegan al usuario por `on_event` —que
+    es como ve el progreso del tunel— asi que mandarlos tambien al log los imprimiria
+    dos veces. Con `--debug` bajan los dos.
+    """
+    return "DEBUG" if debug else "WARNING"
+
+
+def guarded(action: Callable[[], None]) -> None:
+    """Traduce excepciones a codigos de salida: 1 negocio, 2 configuracion, 3 tunel."""
+    try:
+        action()
+    except typer.Exit:
+        raise
+    except ConfigError as exc:
+        typer.echo(f"ERROR DE CONFIGURACION - {exc}", err=True)
+        raise typer.Exit(code=EXIT_CONFIG)
+    except TunnelError as exc:
+        typer.echo(f"ERROR DE TUNEL - {exc}", err=True)
+        raise typer.Exit(code=EXIT_TUNNEL)
+    except Exception as exc:
+        typer.echo(f"ERROR - {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(code=EXIT_BUSINESS)
+
+
+def printer(debug: bool = False) -> Callable[[Dict[str, Any]], None]:
+    def _print(event: Dict[str, Any]) -> None:
+        if event["level"] == "DEBUG" and not debug:
+            return
+        extras = {
+            key: value
+            for key, value in event.items()
+            if key not in ("ts", "level", "event", "message")
+        }
+        typer.echo(
+            f'{event["ts"]} [{event["level"]}] {event["event"]}: {event["message"]} | {extras}',
+            err=True,
+        )
+
+    return _print
 
 
 def read_sql(sql_file: Path) -> str:
@@ -44,6 +107,34 @@ def strip_trailing_semicolons(sql: str) -> str:
     return cleaned
 
 
+def first_keyword(sql: str) -> str:
+    """
+    Primera palabra de la sentencia, saltando comentarios de linea y de bloque.
+
+    Solo sirve para decidir si el SQL se puede envolver con LIMIT: el SQL que se
+    ejecuta es el original, con sus comentarios intactos. Se consume desde el inicio y
+    se para en el primer token real, asi que un `--` dentro de una cadena literal nunca
+    se confunde con un comentario —para cuando aparece, ya paramos—.
+
+    Devuelve "" si el archivo no trae mas que comentarios y espacios.
+    """
+    i, n = 0, len(sql)
+    while i < n:
+        if sql[i].isspace():
+            i += 1
+        elif sql.startswith("--", i):
+            salto = sql.find("\n", i)
+            i = n if salto == -1 else salto + 1
+        elif sql.startswith("/*", i):
+            cierre = sql.find("*/", i + 2)
+            i = n if cierre == -1 else cierre + 2
+        else:
+            break
+
+    resto = sql[i:]
+    return resto.split(maxsplit=1)[0].lower() if resto.strip() else ""
+
+
 def apply_limit(sql: str, limit: Optional[int]) -> str:
     cleaned = strip_trailing_semicolons(sql)
     if not cleaned:
@@ -54,10 +145,13 @@ def apply_limit(sql: str, limit: Optional[int]) -> str:
     if limit <= 0:
         raise ValueError("--limit debe ser mayor a 0. Usa --full si no quieres limite.")
 
-    first_word = cleaned.lstrip().split(maxsplit=1)[0].lower()
-    if first_word not in {"select", "with"}:
+    palabra = first_keyword(cleaned)
+    if not palabra:
+        raise ValueError("El archivo SQL no trae ninguna sentencia: solo comentarios.")
+    if palabra not in {"select", "with"}:
         raise ValueError(
-            "El modo LIMIT solo funciona con SELECT/WITH. Usa --full para ejecutar este SQL."
+            f"El modo LIMIT solo funciona con SELECT/WITH, y este SQL empieza con "
+            f"'{palabra}'. Usa --full para ejecutar este SQL."
         )
 
     return f"SELECT *\nFROM (\n{cleaned}\n) AS query_limitada\nLIMIT {limit}"
@@ -69,7 +163,7 @@ def is_connection_error(error: Exception) -> bool:
 
 
 def execute_with_retries(
-    connection: str, sql: str, retries: int, retry_wait: float
+    connection: Optional[str], sql: str, retries: int, retry_wait: float
 ) -> pd.DataFrame:
     if retries <= 0:
         raise ValueError("--retries debe ser mayor a 0.")
@@ -79,7 +173,7 @@ def execute_with_retries(
         try:
             if attempt > 1:
                 typer.echo(f"Reintento {attempt}/{retries}...")
-            return extract_sql(db=connection, query=sql)
+            return extract_sql(sql, alias=connection)
         except Exception as error:
             last_error = error
             if not is_connection_error(error):
@@ -107,31 +201,84 @@ def ls() -> None:
     """
     Lista aliases disponibles.
     """
-    configure_logging()
-    for a in list_databases():
-        typer.echo(a)
+
+    def action() -> None:
+        configure_logging(console_level())
+        for a in list_aliases():
+            typer.echo(a)
+
+    guarded(action)
+
+
+@app.command("ping")
+def ping_command(
+    alias: Optional[str] = ALIAS_OPTION,
+    debug: bool = typer.Option(False, "--debug", help="Muestra eventos DEBUG."),
+) -> None:
+    """
+    Verifica la conexion de punta a punta: tunel, cluster y credenciales.
+    """
+
+    def action() -> None:
+        configure_logging(console_level(debug))
+        result = ping(alias, on_event=printer(debug))
+        for key, value in result.items():
+            typer.echo(f"{key}: {value}")
+
+    guarded(action)
+
+
+@app.command("fingerprint")
+def fingerprint_command(
+    alias: Optional[str] = ALIAS_OPTION,
+) -> None:
+    """
+    Muestra el fingerprint de la host key que presenta el bastion.
+    """
+
+    def action() -> None:
+        from redshift_extractor import config as config_mod
+        from redshift_extractor.tunnel import fetch_remote_host_key, fingerprint
+
+        configure_logging(console_level())
+        _app, ssh, _resolved, _rs = config_mod.resolve(alias)
+        key = fetch_remote_host_key(ssh)
+        typer.echo(f"host: {ssh.host}:{ssh.port}")
+        typer.echo(f"tipo: {key.get_name()}")
+        typer.echo(f"fingerprint: {fingerprint(key)}")
+        typer.echo("")
+        typer.echo(
+            "Verificalo con quien administra el bastion y pegalo en el env propio:\n"
+            f"  SSH_HOST_FINGERPRINT={fingerprint(key)}"
+        )
+
+    guarded(action)
 
 
 @app.command()
 def run(
-    db: str = typer.Option(..., help="Alias de base (ver con: redshift-extractor ls)"),
-    query: str = typer.Option(..., help="SQL a ejecutar (entre comillas)"),
+    query: str = typer.Option(..., "--query", help="SQL a ejecutar (entre comillas)"),
+    alias: Optional[str] = ALIAS_OPTION,
     out: str = typer.Option("./output/result.parquet", help="Ruta de salida"),
     fmt: str = typer.Option("parquet", help="csv|parquet"),
 ) -> None:
     """
     Ejecuta un query y guarda el resultado a archivo.
     """
-    configure_logging()
-    df = extract_sql(db=db, query=query)
-    out_path = save_dataframe(df, out, fmt=fmt)  # type: ignore[arg-type]
-    typer.echo(f"OK -> {out_path}")
+
+    def action() -> None:
+        configure_logging(console_level())
+        df = extract_sql(query, alias=alias)
+        out_path = save_dataframe(df, out, fmt=fmt)  # type: ignore[arg-type]
+        typer.echo(f"OK -> {out_path}")
+
+    guarded(action)
 
 
-@app.command()
+@app.command("run-file")
 def run_file(
     sql_file: Path = typer.Argument(..., help="Ruta del archivo .sql a ejecutar."),
-    db: str = typer.Option(..., "--db", help="Alias de base (ver con: redshift-extractor ls)"),
+    alias: Optional[str] = ALIAS_OPTION,
     limit: int = typer.Option(
         DEFAULT_LIMIT, help=f"Limite de filas para prueba rapida. Default: {DEFAULT_LIMIT}"
     ),
@@ -153,14 +300,15 @@ def run_file(
     """
     Ejecuta un archivo .sql. Por defecto aplica LIMIT 10 (usa --full para el query completo).
     """
-    configure_logging()
-    try:
+
+    def action() -> None:
+        configure_logging(console_level())
         raw_sql = read_sql(sql_file)
         effective_limit = None if full else limit
         final_sql = apply_limit(raw_sql, effective_limit)
 
         mode = "FULL" if full else f"LIMIT {limit}"
-        typer.echo(f"Conexion: {db}")
+        typer.echo(f"Conexion: {alias or 'DEFAULT_ALIAS'}")
         typer.echo(f"Archivo: {sql_file}")
         typer.echo(f"Modo: {mode}")
 
@@ -175,7 +323,7 @@ def run_file(
 
         started_at = time.perf_counter()
         df = execute_with_retries(
-            connection=db,
+            connection=alias,
             sql=final_sql,
             retries=retries,
             retry_wait=retry_wait,
@@ -188,6 +336,89 @@ def run_file(
             output.parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(output, index=False)
             typer.echo(f"\nCSV guardado en: {output}")
-    except Exception as error:
-        typer.echo(f"ERROR - {type(error).__name__}: {error}", err=True)
-        raise typer.Exit(code=1)
+
+    guarded(action)
+
+
+ClasesDeError = Tuple[Type[BaseException], Type[BaseException], Type[BaseException]]
+
+
+def clases_de_error() -> Optional[ClasesDeError]:
+    """
+    Devuelve (UsageError, ClickException, Abort) del click que typer este usando.
+
+    Todo sale de la API **publica** de typer, a proposito. La primera version de esto
+    localizaba el modulo `typer._click.exceptions` y sacaba las clases de ahi, y duro
+    exactamente una version de parche: ese modulo privado se mueve.
+
+        typer 0.25.1   typer.Abort -> click.exceptions.Abort
+        typer 0.27.1   typer.Abort -> typer._click.exceptions.Abort
+        typer 0.27.2   typer.Abort -> typer.exceptions.Abort   (ya no esta en _click)
+
+    Lo estable son `typer.Abort` y `typer.BadParameter`, que existen en las tres, y el
+    MRO de `BadParameter` siempre pasa por `UsageError` y `ClickException` vivan donde
+    vivan. Hace falta resolverlas asi, y no con un `except click.UsageError` fijo,
+    porque desde typer 0.27 las excepciones del click vendorizado son clases DISTINTAS
+    de las del paquete `click`: el `except` no matchea y el error de uso escapa como
+    traceback en vez de salir con su codigo.
+
+    Si algo de esto cambia, se devuelve None y `main()` se cae al modo estandar de
+    typer, que es peor -el error de uso vuelve a salir con 2- pero nunca un traceback.
+
+    Identico al de `mongo_extractor`, que llego primero a este problema.
+    """
+    try:
+        por_nombre = {clase.__name__: clase for clase in typer.BadParameter.__mro__}
+        return por_nombre["UsageError"], por_nombre["ClickException"], typer.Abort
+    except (AttributeError, KeyError):  # pragma: no cover - solo si typer se reescribe
+        return None
+
+
+def mostrar_error(exc: BaseException) -> None:
+    """
+    Imprime el error como lo haria click.
+
+    Las clases llegan resueltas en runtime, asi que su interfaz no esta garantizada: si
+    `show()` no estuviera, se imprime a stderr en vez de reventar con AttributeError
+    dentro del propio manejador de errores.
+    """
+    mostrar = getattr(exc, "show", None)
+    if callable(mostrar):
+        mostrar()
+    else:  # pragma: no cover - solo si click deja de tener show()
+        typer.echo(str(exc), err=True)
+
+
+def main() -> None:
+    """
+    Entry point de la consola. Separa los errores de USO de los de configuracion.
+
+    Sin esto, click atrapa el `UsageError` por su cuenta y sale con 2 -el mismo codigo
+    que `EXIT_CONFIG`-, asi que `redshift-extractor ls --alais prod` es indistinguible
+    de un `.env` roto para cualquier script que lea el codigo de salida.
+
+    `standalone_mode=False` es lo que hace que click levante sus excepciones en vez de
+    manejarlas y salir el mismo. Ojo con la asimetria: en ese modo click **devuelve** el
+    codigo de un `typer.Exit` como valor de retorno y solo **levanta** las excepciones
+    de usuario. Tratar las dos igual hace que todo salga con 0.
+    """
+    clases = clases_de_error()
+    if clases is None:
+        # Sin poder distinguirlas, mejor el comportamiento de siempre que un traceback.
+        app()
+        return
+
+    usage_error, click_exception, abort = clases
+
+    try:
+        codigo = app(standalone_mode=False)
+    except usage_error as exc:
+        mostrar_error(exc)
+        raise SystemExit(EXIT_USAGE)
+    except click_exception as exc:
+        mostrar_error(exc)
+        raise SystemExit(getattr(exc, "exit_code", EXIT_BUSINESS))
+    except abort:
+        raise SystemExit(EXIT_INTERRUPTED)
+
+    raise SystemExit(codigo if isinstance(codigo, int) else EXIT_OK)

@@ -1,34 +1,57 @@
 name: CI
 
 on:
-  pull_request:
+  # Todas las ramas, no solo main: el valor de la matriz esta en enterarse del
+  # fallo al pushear la rama, no al abrir el PR.
   push:
-    branches: [ "main" ]
+  pull_request:
+
+# Un push sobre una rama con PR abierto dispara dos corridas -la cabeza de la rama
+# y el resultado del merge- y las dos importan: main puede haberse movido. Lo que se
+# evita es apilarlas: cada push nuevo cancela la corrida anterior de su mismo ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # El piso declarado (requires-python = ">=3.10") y la version actual.
+        # Un piso que nadie corre es un piso sin verificar (K5).
+        python-version: [ "3.10", "3.13" ]
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev,parquet]"
 
       - name: Lint (ruff)
-        run: |
-          ruff check .
+        run: ruff check .
 
       - name: Typecheck (mypy)
-        run: |
-          mypy src
+        run: mypy
 
+      # `integration` necesita el bastion y el cluster real; no existen en el runner.
+      # Los de `sshserver` si corren: el servidor SSH de prueba es en proceso.
       - name: Tests
         run: |
-          pytest -q
+          set -o pipefail
+          pytest -q -m "not integration" 2>&1 | tee pytest.log
+
+      # El detalle del fallo solo vive en el log del job, que hay que abrir a mano y
+      # con permisos de lectura de Actions. Como anotacion sale en el check mismo.
+      - name: Reportar el fallo de la suite
+        if: failure()
+        run: |
+          echo "::error title=pytest (${{ matrix.python-version }})::$(tail -c 2200 pytest.log | tr '\n' '~')"
